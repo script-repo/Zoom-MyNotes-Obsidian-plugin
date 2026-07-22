@@ -510,66 +510,58 @@ def _wait_opened(page: Page, note: NoteRef) -> None:
 def _menu_item_labels(page: Page) -> List[str]:
     """Collect visible menu/list item labels for diagnostics."""
     labels: List[str] = []
-    for sel in (
-        '[role="menuitem"]',
-        '[role="option"]',
-        '[role="menu"] button',
-        '[role="menu"] a',
-        'div[role="menu"] *',
-    ):
-        try:
-            loc = page.locator(sel)
-            count = min(loc.count(), 40)
-        except PWError:
-            continue
+    try:
+        loc = page.get_by_role("menuitem")
+        count = min(loc.count(), 40)
         for i in range(count):
             try:
                 item = loc.nth(i)
                 if not item.is_visible():
                     continue
-                text = _clean(item.inner_text(timeout=800))
+                text = _clean(item.inner_text(timeout=500))
             except PWError:
                 continue
             if text and text not in labels and len(text) < 120:
                 labels.append(text)
-        if labels:
-            break
+    except PWError:
+        pass
     return labels
 
 
-def _find_download_menu_item(page: Page) -> Optional[Locator]:
-    """Find a download/export transcript control with loose matching."""
-    item = _first_usable(page, SELECTORS["download_transcript"])
-    if item is not None:
-        return item
+def _click_timeout_ms() -> int:
+    return min(5000, int(config.ACTION_TIMEOUT_MS))
 
-    # Scan all menuitems for transcript-related actions.
-    patterns = (
-        re.compile(r"download\s+transcript", re.I),
-        re.compile(r"export\s+transcript", re.I),
-        re.compile(r"download\s+.*transcript", re.I),
-        re.compile(r"transcript\s*\.(txt|vtt|docx|md)", re.I),
-        re.compile(r"^download$", re.I),
-        re.compile(r"^export$", re.I),
-    )
+
+def _safe_click(locator: Locator, *, timeout_ms: int = None) -> Optional[str]:
+    """Click a locator; return None on success or an error string."""
+    timeout_ms = timeout_ms if timeout_ms is not None else _click_timeout_ms()
     try:
-        loc = page.locator('[role="menuitem"], [role="option"], [role="menu"] button, [role="menu"] a')
-        count = min(loc.count(), 40)
+        locator.scroll_into_view_if_needed(timeout=timeout_ms)
+    except PWError:
+        pass
+    try:
+        locator.click(timeout=timeout_ms, force=False)
+        return None
+    except PWError:
+        pass
+    try:
+        locator.click(timeout=timeout_ms, force=True)
+        return None
+    except PWError as exc:
+        return str(exc)[:240]
+
+
+def _menuitem_by_name(page: Page, pattern: re.Pattern[str]) -> Optional[Locator]:
+    """Return a stable role=menuitem locator matched by accessible name."""
+    try:
+        loc = page.get_by_role("menuitem", name=pattern)
+        if loc.count() <= 0:
+            return None
+        first = loc.first
+        if first.is_visible():
+            return first
     except PWError:
         return None
-    for i in range(count):
-        try:
-            candidate = loc.nth(i)
-            if not candidate.is_visible():
-                continue
-            text = _clean(candidate.inner_text(timeout=800))
-        except PWError:
-            continue
-        if not text:
-            continue
-        for pat in patterns:
-            if pat.search(text):
-                return candidate
     return None
 
 
@@ -580,7 +572,7 @@ def _all_kebabs(page: Page) -> List[Locator]:
     for sel in SELECTORS["kebab"]:
         try:
             loc = page.locator(sel)
-            count = min(loc.count(), 20)
+            count = min(loc.count(), 12)
         except PWError:
             continue
         for i in range(count):
@@ -600,7 +592,7 @@ def _all_kebabs(page: Page) -> List[Locator]:
                 continue
             seen.add(key)
             found.append(item)
-    # Prefer buttons further right / in the content header (typical note chrome).
+
     def _sort_key(el: Locator) -> tuple:
         try:
             box = el.bounding_box() or {"x": 0, "y": 0}
@@ -632,31 +624,69 @@ def _write_text_download(dest: Path, text: str) -> DownloadResult:
     )
 
 
-def _extract_transcript_from_page(page: Page) -> str:
-    """Best-effort scrape of an on-page Transcript panel when menu download is missing."""
-    # Open Transcript tab if present.
-    tab = _first_usable(page, SELECTORS["transcript_tab"])
-    if tab is not None:
-        try:
-            tab.click(timeout=config.ACTION_TIMEOUT_MS)
-            page.wait_for_timeout(1000)
-        except PWError:
-            pass
+_SPEAKER_LINE = re.compile(
+    r"^(?P<span>.{1,80}?)\s*[:\-–—]\s+.+$|"
+    r"^\[[0-9:.]+\]\s*.+$|"
+    r"^[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?\s+.+$",
+    re.M,
+)
 
-    # Prefer dedicated transcript containers.
+
+def _looks_like_transcript(text: str) -> bool:
+    body = (text or "").strip()
+    if len(body) < 80:
+        return False
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if len(lines) < 4:
+        return False
+    speaker_hits = len(_SPEAKER_LINE.findall(body))
+    if speaker_hits >= 2:
+        return True
+    # Long multi-line body from an opened note is still useful.
+    return len(lines) >= 8 and len(body) >= 300
+
+
+def _extract_transcript_from_page(page: Page) -> str:
+    """Best-effort scrape of an on-page Transcript / AI notes panel."""
+    # Open Transcript tab if present.
+    for sel in SELECTORS["transcript_tab"]:
+        try:
+            loc = page.locator(sel)
+            count = min(loc.count(), 6)
+        except PWError:
+            continue
+        for i in range(count):
+            try:
+                tab = loc.nth(i)
+                if not tab.is_visible():
+                    continue
+                label = _clean(tab.inner_text(timeout=500)).lower()
+                if "transcript" not in label and i > 0:
+                    continue
+                err = _safe_click(tab, timeout_ms=3000)
+                if err is None:
+                    page.wait_for_timeout(1200)
+                    break
+            except PWError:
+                continue
+
     container_sels = [
         '[data-testid*="transcript" i]',
         '[class*="transcript" i]',
         '[aria-label*="transcript" i]',
+        '[class*="Transcript" i]',
         'section:has-text("Transcript")',
+        'article',
+        '[role="article"]',
         'main',
         '[role="main"]',
+        '[contenteditable="true"]',
     ]
     best = ""
     for sel in container_sels:
         try:
             loc = page.locator(sel)
-            count = min(loc.count(), 8)
+            count = min(loc.count(), 10)
         except PWError:
             continue
         for i in range(count):
@@ -664,131 +694,177 @@ def _extract_transcript_from_page(page: Page) -> str:
                 item = loc.nth(i)
                 if not item.is_visible():
                     continue
-                text = item.inner_text(timeout=3000)
+                text = item.inner_text(timeout=2500)
             except PWError:
                 continue
             text = (text or "").strip()
-            # Heuristic: real transcripts are multi-line and longer than chrome.
-            if text.count("\n") >= 3 and len(text) > len(best):
-                # Drop obvious shell chrome lines.
-                lines = [
-                    ln
-                    for ln in text.splitlines()
-                    if _clean(ln).lower()
-                    not in OPENED_TITLE_DENYLIST | NAV_DENYLIST
-                ]
-                candidate = "\n".join(lines).strip()
-                if len(candidate) > len(best):
-                    best = candidate
-        if len(best) > 400:
+            lines = [
+                ln
+                for ln in text.splitlines()
+                if _clean(ln).lower() not in OPENED_TITLE_DENYLIST | NAV_DENYLIST
+            ]
+            candidate = "\n".join(lines).strip()
+            if not _looks_like_transcript(candidate):
+                continue
+            if len(candidate) > len(best):
+                best = candidate
+        if len(best) > 800:
             break
-    return best
+
+    if best:
+        return best
+
+    # Whole-page fallback (filtered).
+    try:
+        raw = page.locator("body").inner_text(timeout=3000)
+    except PWError:
+        return ""
+    lines = [
+        ln
+        for ln in (raw or "").splitlines()
+        if _clean(ln).lower() not in OPENED_TITLE_DENYLIST | NAV_DENYLIST
+    ]
+    candidate = "\n".join(lines).strip()
+    return candidate if _looks_like_transcript(candidate) else ""
 
 
-def download_transcript(page: Page, dest: Path) -> DownloadResult:
-    """Download transcript via menu, else scrape on-page transcript text."""
+def _try_menu_download(page: Page, dest: Path) -> DownloadResult:
+    """Open kebabs / export menus and attempt a real file download."""
     import hashlib
+
+    name_patterns = (
+        re.compile(r"download\s+transcript", re.I),
+        re.compile(r"export\s+transcript", re.I),
+        re.compile(r"download\s+.*\.txt", re.I),
+        re.compile(r"transcript\s*\(.*txt.*\)", re.I),
+        re.compile(r"^transcript$", re.I),
+    )
+    export_patterns = (
+        re.compile(r"^export$", re.I),
+        re.compile(r"^download$", re.I),
+        re.compile(r"export\s+as", re.I),
+        re.compile(r"download\s+as", re.I),
+    )
 
     kebabs = _all_kebabs(page)
     if not kebabs:
-        # Last resort: page scrape without menu.
-        scraped = _extract_transcript_from_page(page)
-        if scraped:
-            return _write_text_download(dest, scraped)
         return DownloadResult(DownloadOutcome.SELECTOR_BROKEN, error="kebab not found")
 
     menu_labels_seen: List[str] = []
     last_error = "download menu item missing"
 
-    for kebab in kebabs[:6]:
+    for kebab in kebabs[:5]:
         _dismiss_menu(page)
-        try:
-            kebab.click(timeout=config.ACTION_TIMEOUT_MS)
-        except PWTimeoutError as exc:
-            last_error = f"kebab click: {exc}"
-            continue
-        except PWError as exc:
-            last_error = f"kebab click: {exc}"
+        err = _safe_click(kebab)
+        if err:
+            last_error = f"kebab click: {err}"
             continue
 
-        try:
-            page.wait_for_timeout(900)
-            labels = _menu_item_labels(page)
-            for lab in labels:
+        page.wait_for_timeout(700)
+        for lab in _menu_item_labels(page):
+            if lab not in menu_labels_seen:
+                menu_labels_seen.append(lab)
+
+        # Nested Export/Download menus first.
+        for exp_pat in export_patterns:
+            exp = _menuitem_by_name(page, exp_pat)
+            if exp is None:
+                continue
+            exp_err = _safe_click(exp)
+            if exp_err:
+                continue
+            page.wait_for_timeout(600)
+            for lab in _menu_item_labels(page):
                 if lab not in menu_labels_seen:
                     menu_labels_seen.append(lab)
 
-            item = _find_download_menu_item(page)
-            if item is None:
-                last_error = "download menu item missing"
-                continue
+        target: Optional[Locator] = None
+        for pat in name_patterns:
+            target = _menuitem_by_name(page, pat)
+            if target is not None:
+                break
+        if target is None:
+            # Fallback CSS selectors (stable .first, not nth index).
+            target = _first_usable(page, SELECTORS["download_transcript"])
+        if target is None:
+            last_error = "download menu item missing"
+            _dismiss_menu(page)
+            continue
 
-            part = dest.with_suffix(dest.suffix + ".part")
-            if part.exists():
-                try:
-                    part.unlink()
-                except OSError:
-                    pass
-
+        part = dest.with_suffix(dest.suffix + ".part")
+        if part.exists():
             try:
-                with page.expect_download(timeout=config.DOWNLOAD_TIMEOUT_MS) as dl_info:
-                    item.click(timeout=config.ACTION_TIMEOUT_MS)
-                download = dl_info.value
-            except PWTimeoutError as exc:
-                # Some UIs copy/export without a browser download event — try scrape.
-                last_error = f"download timeout: {exc}"
-                scraped = _extract_transcript_from_page(page)
-                if scraped:
-                    return _write_text_download(dest, scraped)
-                continue
-            except PWError as exc:
-                last_error = f"download error: {exc}"
-                continue
+                part.unlink()
+            except OSError:
+                pass
 
-            dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with page.expect_download(timeout=min(20000, config.DOWNLOAD_TIMEOUT_MS)) as dl_info:
+                click_err = _safe_click(target, timeout_ms=4000)
+                if click_err:
+                    raise PWTimeoutError(click_err)
+            download = dl_info.value
+        except PWTimeoutError as exc:
+            last_error = f"download/click timeout: {exc}"
+            _dismiss_menu(page)
+            continue
+        except PWError as exc:
+            last_error = f"download error: {exc}"
+            _dismiss_menu(page)
+            continue
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
             download.save_as(str(part))
-            try:
-                size = part.stat().st_size
-            except OSError as exc:
-                return DownloadResult(DownloadOutcome.RETRYABLE, error=f"stat failed: {exc}")
+            size = part.stat().st_size
             if size <= 0:
-                try:
-                    part.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                part.unlink(missing_ok=True)
                 last_error = "empty download"
+                _dismiss_menu(page)
                 continue
-
-            try:
-                data = part.read_bytes()
-                if b"\x00" in data[:2048]:
-                    part.unlink(missing_ok=True)
-                    last_error = "binary download"
-                    continue
-                digest = hashlib.sha256(data).hexdigest()
-            except OSError as exc:
-                return DownloadResult(DownloadOutcome.RETRYABLE, error=f"hash failed: {exc}")
-
+            data = part.read_bytes()
+            if b"\x00" in data[:2048]:
+                part.unlink(missing_ok=True)
+                last_error = "binary download"
+                _dismiss_menu(page)
+                continue
+            digest = hashlib.sha256(data).hexdigest()
             part.replace(dest)
+            _dismiss_menu(page)
             return DownloadResult(
                 DownloadOutcome.DOWNLOADED, path=dest, size=size, sha256=digest
             )
-        finally:
+        except OSError as exc:
             _dismiss_menu(page)
+            return DownloadResult(DownloadOutcome.RETRYABLE, error=f"save failed: {exc}")
 
-    # Menu path failed — scrape transcript panel from the open note.
+    detail = last_error
+    if menu_labels_seen:
+        detail = f"{last_error}; menu items: [{', '.join(menu_labels_seen[:12])}]"
+    return DownloadResult(DownloadOutcome.RETRYABLE, error=detail)
+
+
+def download_transcript(page: Page, dest: Path) -> DownloadResult:
+    """Prefer on-page transcript scrape; fall back to menu file download."""
+    # AI Companion notes usually render transcript/summary in the open view.
     scraped = _extract_transcript_from_page(page)
     if scraped:
         return _write_text_download(dest, scraped)
 
-    detail = last_error
-    if menu_labels_seen:
-        preview = ", ".join(menu_labels_seen[:12])
-        detail = f"{last_error}; menu items: [{preview}]"
-    # Missing download action is often UI-shift, not true absence.
-    if "menu item missing" in last_error:
-        return DownloadResult(DownloadOutcome.SELECTOR_BROKEN, error=detail)
-    return DownloadResult(DownloadOutcome.ABSENT, error=detail)
+    menu_result = _try_menu_download(page, dest)
+    if menu_result.outcome == DownloadOutcome.DOWNLOADED:
+        return menu_result
+
+    # Scrape again after menus may have revealed panels.
+    scraped = _extract_transcript_from_page(page)
+    if scraped:
+        return _write_text_download(dest, scraped)
+
+    # Keep retryable so backoff is short and next run tries again.
+    if menu_result.outcome != DownloadOutcome.DOWNLOADED:
+        save_diagnostics(page, f"no-transcript-{dest.stem[:40]}")
+        return menu_result
+    return DownloadResult(DownloadOutcome.ABSENT, error="no transcript content found")
 
 
 def _dismiss_menu(page: Page) -> None:

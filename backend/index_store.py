@@ -134,6 +134,10 @@ class IndexStore:
             "download menu item missing",
             "menu items:",
             "kebab not found",
+            "download/click timeout",
+            "download timeout",
+            "locator.click",
+            "requeued for selector",
         )
         count = 0
         for key, rec in list(self.transcripts.items()):
