@@ -1239,7 +1239,6 @@ var ZoomSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     return [
       {
         type: "group",
-        heading: "General",
         items: [
           {
             name: "About",
@@ -1395,7 +1394,6 @@ var ZoomSyncSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian.Setting(containerEl).setName("General").setHeading();
     containerEl.createEl("p", {
       text: "Controls the Python + Playwright backend that downloads Zoom AI notes transcripts into this vault."
     });

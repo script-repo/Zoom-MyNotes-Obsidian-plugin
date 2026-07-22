@@ -302,7 +302,6 @@ class ZoomSyncSettingTab extends PluginSettingTab {
     return [
       {
         type: "group",
-        heading: "General",
         items: [
           {
             name: "About",
@@ -463,8 +462,6 @@ class ZoomSyncSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-
-    new Setting(containerEl).setName("General").setHeading();
 
     containerEl.createEl("p", {
       text: "Controls the Python + Playwright backend that downloads Zoom AI notes transcripts into this vault.",
