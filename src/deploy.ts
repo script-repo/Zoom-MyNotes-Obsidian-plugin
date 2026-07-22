@@ -155,10 +155,18 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
   set("root", "running", "Checking…");
   const root = resolveSyncRoot(ctx.settings);
   if (!looksLikeSyncRoot(root)) {
+    const hint =
+      process.platform === "darwin"
+        ? "/Users/you/zoom-mynotes-sync"
+        : process.platform === "win32"
+          ? "C:\\Users\\you\\zoom-mynotes-sync"
+          : "/home/you/zoom-mynotes-sync";
     set(
       "root",
       "fail",
-      `Set Sync repo path in settings to the zoom-mynotes-sync folder (has sync.py). Got: ${root || "(empty)"}`
+      root
+        ? `Not a valid sync repo (need sync.py, config.py, requirements.txt):\n${root}`
+        : `Sync repo path is empty. In this wizard (or Settings), set it to the folder that contains sync.py.\nExample: ${hint}`
     );
     return steps;
   }

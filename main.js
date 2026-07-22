@@ -769,10 +769,13 @@ async function runFullDeploy(ctx) {
   set("root", "running", "Checking\u2026");
   const root = resolveSyncRoot(ctx.settings);
   if (!looksLikeSyncRoot(root)) {
+    const hint = process.platform === "darwin" ? "/Users/you/zoom-mynotes-sync" : process.platform === "win32" ? "C:\\Users\\you\\zoom-mynotes-sync" : "/home/you/zoom-mynotes-sync";
     set(
       "root",
       "fail",
-      `Set Sync repo path in settings to the zoom-mynotes-sync folder (has sync.py). Got: ${root || "(empty)"}`
+      root ? `Not a valid sync repo (need sync.py, config.py, requirements.txt):
+${root}` : `Sync repo path is empty. In this wizard (or Settings), set it to the folder that contains sync.py.
+Example: ${hint}`
     );
     return steps;
   }
@@ -1478,8 +1481,10 @@ var DeployModal = class extends import_obsidian.Modal {
     super(app);
     this.stepsEl = null;
     this.logEl = null;
+    this.pathInput = "";
     this.busy = false;
     this.plugin = plugin;
+    this.pathInput = plugin.settings.syncRoot || "";
   }
   onOpen() {
     const { contentEl } = this;
@@ -1487,12 +1492,23 @@ var DeployModal = class extends import_obsidian.Modal {
     contentEl.addClass("zoom-deploy-modal");
     new import_obsidian.Setting(contentEl).setName("Deploy wizard").setHeading();
     contentEl.createEl("p", {
-      text: "Sets up the Python backend, vault output folder, OS background job (Task Scheduler / launchd / cron), and this plugin. Works on Windows, macOS, and Linux."
+      text: "This plugin controls a separate Python project (the folder that contains sync.py). Enter that folder\u2019s absolute path below, then run deploy."
+    });
+    const pathPlaceholder = process.platform === "win32" ? "C:\\Users\\you\\zoom-mynotes-sync" : process.platform === "darwin" ? "/Users/you/zoom-mynotes-sync" : "/home/you/zoom-mynotes-sync";
+    new import_obsidian.Setting(contentEl).setName("Sync repo path").setDesc(
+      "Absolute path to the folder with sync.py, config.py, and requirements.txt. Required before deploy."
+    ).addText((t) => {
+      t.setPlaceholder(pathPlaceholder).setValue(this.pathInput).onChange((v) => {
+        this.pathInput = v.trim();
+      });
+      t.inputEl.style.width = "100%";
     });
     this.stepsEl = contentEl.createDiv();
     this.renderSteps([]);
     this.logEl = contentEl.createDiv({ cls: "zoom-log-tail" });
-    this.logEl.setText("Ready.");
+    this.logEl.setText(
+      this.pathInput ? "Ready. Click Run full deploy." : "Enter the sync repo path above, then click Run full deploy."
+    );
     new import_obsidian.Setting(contentEl).addButton(
       (b) => b.setButtonText("Run full deploy").setCta().onClick(() => void this.run())
     ).addButton((b) => b.setButtonText("Close").onClick(() => this.close()));
@@ -1505,7 +1521,7 @@ var DeployModal = class extends import_obsidian.Modal {
     this.stepsEl.empty();
     if (!steps.length) {
       this.stepsEl.createEl("p", {
-        text: "Click \u201CRun full deploy\u201D to start. You can re-run anytime; safe steps are skipped when already done."
+        text: "After the path is set, click Run full deploy. Safe to re-run; completed steps are skipped when already done."
       });
       return;
     }
@@ -1523,7 +1539,7 @@ var DeployModal = class extends import_obsidian.Modal {
   appendLog(line) {
     if (!this.logEl) return;
     const prev = this.logEl.getText();
-    const next = (prev === "Ready." ? "" : prev + "\n") + line;
+    const next = (prev.startsWith("Ready") || prev.startsWith("Enter ") ? "" : prev + "\n") + line;
     this.logEl.setText(next.slice(-4e3));
     this.logEl.scrollTop = this.logEl.scrollHeight;
   }
@@ -1532,6 +1548,26 @@ var DeployModal = class extends import_obsidian.Modal {
       new import_obsidian.Notice("A job is already running");
       return;
     }
+    const pathVal = this.pathInput.trim();
+    if (!pathVal) {
+      new import_obsidian.Notice("Enter the sync repo path first (folder containing sync.py)");
+      this.appendLog(
+        "Missing sync repo path. Example (macOS): /Users/you/zoom-mynotes-sync"
+      );
+      return;
+    }
+    if (!looksLikeSyncRoot(pathVal)) {
+      new import_obsidian.Notice(
+        "Path must be a folder that contains sync.py, config.py, and requirements.txt"
+      );
+      this.appendLog(
+        `Not a valid sync repo: ${pathVal}
+Expected files: sync.py, config.py, requirements.txt`
+      );
+      return;
+    }
+    this.plugin.settings.syncRoot = pathVal;
+    await this.plugin.saveSettings();
     this.busy = true;
     try {
       const steps = await runFullDeploy({
