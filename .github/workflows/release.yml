@@ -1,4 +1,4 @@
-name: Release Obsidian plugin
+﻿name: Release Obsidian plugin
 
 on:
   push:
@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
@@ -17,6 +19,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: npm
 
       - name: Build
         run: |
@@ -27,21 +30,32 @@ jobs:
         run: |
           mkdir -p dist
           cp main.js manifest.json styles.css dist/
-          # Fail if version tag does not match manifest
           TAG="${GITHUB_REF_NAME}"
+          TAG_STRIPPED="${TAG#v}"
           VER=$(node -p "require('./manifest.json').version")
-          if [ "$TAG" != "$VER" ]; then
+          if [ "$TAG" != "$VER" ] && [ "$TAG_STRIPPED" != "$VER" ]; then
             echo "Tag $TAG must equal manifest.json version $VER"
             exit 1
           fi
+          ls -la dist/
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/main.js
+            dist/styles.css
+            dist/manifest.json
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          name: ${{ github.ref_name }}
           files: |
             dist/main.js
             dist/manifest.json
             dist/styles.css
           generate_release_notes: true
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
