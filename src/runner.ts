@@ -76,8 +76,8 @@ export function cancelActive(): boolean {
 }
 
 /**
- * Pass only env vars needed for Python/Playwright child processes.
- * Avoids forwarding the entire process environment (fingerprint risk).
+ * Pass only non-identity env vars needed to locate executables and temp dirs.
+ * Does not forward HOME/USERPROFILE/USERNAME or other identity-related values.
  */
 function baseChildEnv(): NodeJS.ProcessEnv {
   const keys = [
@@ -90,15 +90,6 @@ function baseChildEnv(): NodeJS.ProcessEnv {
     "TEMP",
     "TMP",
     "TMPDIR",
-    "HOME",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "XDG_CACHE_HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
@@ -132,16 +123,26 @@ function buildEnv(
   extra?: NodeJS.ProcessEnv
 ): NodeJS.ProcessEnv {
   const transcripts = resolveTranscriptsDir(settings, vaultPath);
-  return {
+  const root = resolveSyncRoot(settings);
+  // Sandbox "home" under the sync repo so Playwright/Python never need the real user profile.
+  const sandbox = root ? path.join(root, ".runtime-home") : "";
+  const env: NodeJS.ProcessEnv = {
     ...baseChildEnv(),
     ZOOM_TRANSCRIPTS_DIR: transcripts,
     ZOOM_HEADLESS: settings.headless ? "1" : "0",
     ZOOM_LOG_TITLES: settings.logTitles ? "1" : "0",
-    ZOOM_BROWSER_CHANNEL:
-      process.env.ZOOM_BROWSER_CHANNEL || defaultBrowserChannel(),
+    ZOOM_BROWSER_CHANNEL: defaultBrowserChannel(),
     PYTHONUNBUFFERED: "1",
-    ...extra,
   };
+  if (sandbox) {
+    env.HOME = sandbox;
+    env.USERPROFILE = sandbox;
+    env.XDG_CACHE_HOME = path.join(sandbox, "cache");
+    env.XDG_CONFIG_HOME = path.join(sandbox, "config");
+    env.XDG_DATA_HOME = path.join(sandbox, "data");
+    env.PLAYWRIGHT_BROWSERS_PATH = path.join(root, ".playwright");
+  }
+  return { ...env, ...extra };
 }
 
 function toError(err: unknown): Error {

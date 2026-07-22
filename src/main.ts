@@ -302,7 +302,7 @@ class ZoomSyncSettingTab extends PluginSettingTab {
     return [
       {
         type: "group",
-        heading: "Zoom MyNotes Sync",
+        heading: "General",
         items: [
           {
             name: "About",
@@ -310,7 +310,7 @@ class ZoomSyncSettingTab extends PluginSettingTab {
           },
           {
             name: "Sync repo path",
-            desc: "Absolute path to the zoom-mynotes-sync repository (contains sync.py).",
+            desc: "Absolute path to the zoom-mynotes-sync repository (contains sync.py). Do not use ~.",
             aliases: ["sync root", "python repo"],
             control: {
               type: "text",
@@ -320,7 +320,7 @@ class ZoomSyncSettingTab extends PluginSettingTab {
           },
           {
             name: "Python path",
-            desc: "Optional. Leave empty to use .venv (Windows: Scripts/python.exe, macOS/Linux: bin/python3).",
+            desc: "Optional absolute path. Leave empty to use .venv (Windows: Scripts/python.exe, macOS/Linux: bin/python3).",
             control: {
               type: "text",
               key: "pythonPath",
@@ -464,7 +464,7 @@ class ZoomSyncSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    new Setting(containerEl).setName("Zoom MyNotes Sync").setHeading();
+    new Setting(containerEl).setName("General").setHeading();
 
     containerEl.createEl("p", {
       text: "Controls the Python + Playwright backend that downloads Zoom AI notes transcripts into this vault.",
@@ -626,7 +626,7 @@ class DeployModal extends Modal {
     contentEl.empty();
     contentEl.addClass("zoom-deploy-modal");
 
-    new Setting(contentEl).setName("Zoom MyNotes deploy wizard").setHeading();
+    new Setting(contentEl).setName("Deploy wizard").setHeading();
 
     contentEl.createEl("p", {
       text: "Sets up the Python backend, vault output folder, OS background job (Task Scheduler / launchd / cron), and this plugin. Works on Windows, macOS, and Linux.",

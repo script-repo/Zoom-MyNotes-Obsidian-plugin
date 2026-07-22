@@ -47,9 +47,6 @@ function hostPlatform() {
   if (process.platform === "linux") return "linux";
   return "other";
 }
-function homeDir() {
-  return process.env.HOME || process.env.USERPROFILE || "";
-}
 function defaultBrowserChannel() {
   return hostPlatform() === "win32" ? "msedge" : "chromium";
 }
@@ -100,12 +97,7 @@ var fs = __toESM(require("fs"));
 var path2 = __toESM(require("path"));
 function expandPath(raw) {
   if (!raw) return "";
-  let p = raw.trim();
-  if (p.startsWith("~")) {
-    const home = homeDir();
-    p = path2.join(home, p.slice(1).replace(/^[\\/]/, ""));
-  }
-  return path2.normalize(p);
+  return path2.normalize(raw.trim());
 }
 function pathExists(p) {
   try {
@@ -224,15 +216,6 @@ function baseChildEnv() {
     "TEMP",
     "TMP",
     "TMPDIR",
-    "HOME",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "XDG_CACHE_HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
@@ -261,15 +244,25 @@ function baseChildEnv() {
 }
 function buildEnv(settings, vaultPath, extra) {
   const transcripts = resolveTranscriptsDir(settings, vaultPath);
-  return {
+  const root = resolveSyncRoot(settings);
+  const sandbox = root ? path3.join(root, ".runtime-home") : "";
+  const env = {
     ...baseChildEnv(),
     ZOOM_TRANSCRIPTS_DIR: transcripts,
     ZOOM_HEADLESS: settings.headless ? "1" : "0",
     ZOOM_LOG_TITLES: settings.logTitles ? "1" : "0",
-    ZOOM_BROWSER_CHANNEL: process.env.ZOOM_BROWSER_CHANNEL || defaultBrowserChannel(),
-    PYTHONUNBUFFERED: "1",
-    ...extra
+    ZOOM_BROWSER_CHANNEL: defaultBrowserChannel(),
+    PYTHONUNBUFFERED: "1"
   };
+  if (sandbox) {
+    env.HOME = sandbox;
+    env.USERPROFILE = sandbox;
+    env.XDG_CACHE_HOME = path3.join(sandbox, "cache");
+    env.XDG_CONFIG_HOME = path3.join(sandbox, "config");
+    env.XDG_DATA_HOME = path3.join(sandbox, "data");
+    env.PLAYWRIGHT_BROWSERS_PATH = path3.join(root, ".playwright");
+  }
+  return { ...env, ...extra };
 }
 function toError(err) {
   return err instanceof Error ? err : new Error(String(err));
@@ -483,13 +476,7 @@ exit $LASTEXITCODE
 async function registerWindows(ctx, runPs1) {
   const root = resolveSyncRoot(ctx.settings);
   const script = path4.join(root, "scripts", "register-task.ps1");
-  const ps = process.env.SystemRoot ? path4.join(
-    process.env.SystemRoot,
-    "System32",
-    "WindowsPowerShell",
-    "v1.0",
-    "powershell.exe"
-  ) : "powershell.exe";
+  const ps = "powershell.exe";
   if (isFile(script)) {
     return runProcess({
       kind: "register-task",
@@ -534,10 +521,10 @@ async function registerWindows(ctx, runPs1) {
 async function registerDarwin(ctx, runSh) {
   const name = sanitizeJobName(ctx.settings.taskName);
   const label = `com.zoom-mynotes-sync.${name}`;
-  const agentsDir = path4.join(homeDir(), "Library", "LaunchAgents");
+  const root = resolveSyncRoot(ctx.settings);
+  const agentsDir = path4.join(root, "launchd");
   fs3.mkdirSync(agentsDir, { recursive: true });
   const plistPath = path4.join(agentsDir, `${label}.plist`);
-  const root = resolveSyncRoot(ctx.settings);
   const logOut = path4.join(root, "logs", "launchd-stdout.log");
   const logErr = path4.join(root, "logs", "launchd-stderr.log");
   fs3.mkdirSync(path4.join(root, "logs"), { recursive: true });
@@ -927,7 +914,15 @@ ${summarizeResult(result)}`);
   } catch (e) {
     set("task", "fail", e instanceof Error ? e.message : String(e));
   }
-  const configDir = ctx.configDir || ".obsidian";
+  const configDir = (ctx.configDir || "").trim();
+  if (!configDir) {
+    set(
+      "plugin",
+      "fail",
+      "Missing vault config directory (Vault.configDir is empty)."
+    );
+    return steps;
+  }
   set("plugin", "running", `Copying plugin into ${configDir}/plugins\u2026`);
   try {
     const dest = path5.join(
@@ -1244,7 +1239,7 @@ var ZoomSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     return [
       {
         type: "group",
-        heading: "Zoom MyNotes Sync",
+        heading: "General",
         items: [
           {
             name: "About",
@@ -1252,7 +1247,7 @@ var ZoomSyncSettingTab = class extends import_obsidian.PluginSettingTab {
           },
           {
             name: "Sync repo path",
-            desc: "Absolute path to the zoom-mynotes-sync repository (contains sync.py).",
+            desc: "Absolute path to the zoom-mynotes-sync repository (contains sync.py). Do not use ~.",
             aliases: ["sync root", "python repo"],
             control: {
               type: "text",
@@ -1262,7 +1257,7 @@ var ZoomSyncSettingTab = class extends import_obsidian.PluginSettingTab {
           },
           {
             name: "Python path",
-            desc: "Optional. Leave empty to use .venv (Windows: Scripts/python.exe, macOS/Linux: bin/python3).",
+            desc: "Optional absolute path. Leave empty to use .venv (Windows: Scripts/python.exe, macOS/Linux: bin/python3).",
             control: {
               type: "text",
               key: "pythonPath",
@@ -1400,7 +1395,7 @@ var ZoomSyncSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian.Setting(containerEl).setName("Zoom MyNotes Sync").setHeading();
+    new import_obsidian.Setting(containerEl).setName("General").setHeading();
     containerEl.createEl("p", {
       text: "Controls the Python + Playwright backend that downloads Zoom AI notes transcripts into this vault."
     });
@@ -1492,7 +1487,7 @@ var DeployModal = class extends import_obsidian.Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("zoom-deploy-modal");
-    new import_obsidian.Setting(contentEl).setName("Zoom MyNotes deploy wizard").setHeading();
+    new import_obsidian.Setting(contentEl).setName("Deploy wizard").setHeading();
     contentEl.createEl("p", {
       text: "Sets up the Python backend, vault output folder, OS background job (Task Scheduler / launchd / cron), and this plugin. Works on Windows, macOS, and Linux."
     });

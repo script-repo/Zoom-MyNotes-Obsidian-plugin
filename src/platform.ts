@@ -9,14 +9,6 @@ export function hostPlatform(): HostPlatform {
   return "other";
 }
 
-/**
- * User home directory for scheduler install paths only (LaunchAgents / ~ expansion).
- * Prefer HOME/USERPROFILE over os.userInfo to avoid extra identity APIs.
- */
-export function homeDir(): string {
-  return process.env.HOME || process.env.USERPROFILE || "";
-}
-
 /** Playwright channel preferred for this OS. */
 export function defaultBrowserChannel(): string {
   return hostPlatform() === "win32" ? "msedge" : "chromium";

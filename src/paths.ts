@@ -1,16 +1,12 @@
 import * as fs from "fs";
 import * as path from "path";
-import { homeDir, venvPythonCandidates } from "./platform";
+import { venvPythonCandidates } from "./platform";
 import type { ZoomSyncSettings } from "./settings";
 
+/** Normalize a user-supplied absolute path. Tilde expansion is not performed. */
 export function expandPath(raw: string): string {
   if (!raw) return "";
-  let p = raw.trim();
-  if (p.startsWith("~")) {
-    const home = homeDir();
-    p = path.join(home, p.slice(1).replace(/^[\\/]/, ""));
-  }
-  return path.normalize(p);
+  return path.normalize(raw.trim());
 }
 
 export function pathExists(p: string): boolean {

@@ -48,7 +48,7 @@ export interface DeployStep {
 export interface DeployContext {
   settings: ZoomSyncSettings;
   vaultPath: string;
-  /** Obsidian config folder name from Vault#configDir (not always `.obsidian`). */
+  /** Obsidian config folder name from Vault#configDir. */
   configDir: string;
   pluginDir: string;
   onUpdate: (steps: DeployStep[]) => void;
@@ -324,8 +324,16 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
     set("task", "fail", e instanceof Error ? e.message : String(e));
   }
 
-  // 9. Install plugin files into vault
-  const configDir = ctx.configDir || ".obsidian";
+  // 9. Install plugin files into vault (config dir from Vault#configDir only)
+  const configDir = (ctx.configDir || "").trim();
+  if (!configDir) {
+    set(
+      "plugin",
+      "fail",
+      "Missing vault config directory (Vault.configDir is empty)."
+    );
+    return steps;
+  }
   set("plugin", "running", `Copying plugin into ${configDir}/plugins…`);
   try {
     const dest = path.join(

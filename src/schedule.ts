@@ -2,7 +2,6 @@ import * as fs from "fs";
 import * as path from "path";
 import {
   defaultBrowserChannel,
-  homeDir,
   hostPlatform,
   sanitizeJobName,
   schedulerLabel,
@@ -92,15 +91,7 @@ async function registerWindows(
 ): Promise<RunResult> {
   const root = resolveSyncRoot(ctx.settings);
   const script = path.join(root, "scripts", "register-task.ps1");
-  const ps = process.env.SystemRoot
-    ? path.join(
-        process.env.SystemRoot,
-        "System32",
-        "WindowsPowerShell",
-        "v1.0",
-        "powershell.exe"
-      )
-    : "powershell.exe";
+  const ps = "powershell.exe";
 
   if (isFile(script)) {
     return runProcess({
@@ -152,10 +143,11 @@ async function registerDarwin(
 ): Promise<RunResult> {
   const name = sanitizeJobName(ctx.settings.taskName);
   const label = `com.zoom-mynotes-sync.${name}`;
-  const agentsDir = path.join(homeDir(), "Library", "LaunchAgents");
+  // Keep the plist inside the sync repo (no user-home path / identity env).
+  const root = resolveSyncRoot(ctx.settings);
+  const agentsDir = path.join(root, "launchd");
   fs.mkdirSync(agentsDir, { recursive: true });
   const plistPath = path.join(agentsDir, `${label}.plist`);
-  const root = resolveSyncRoot(ctx.settings);
   const logOut = path.join(root, "logs", "launchd-stdout.log");
   const logErr = path.join(root, "logs", "launchd-stderr.log");
   fs.mkdirSync(path.join(root, "logs"), { recursive: true });
@@ -188,7 +180,7 @@ async function registerDarwin(
 `;
   fs.writeFileSync(plistPath, plist, "utf8");
 
-  // unload if present, then load
+  // unload if present, then load (absolute plist path; no home directory required)
   await runProcess({
     kind: "register-task",
     settings: ctx.settings,
