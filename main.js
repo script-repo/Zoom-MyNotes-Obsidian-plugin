@@ -33,24 +33,81 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
-var fs4 = __toESM(require("fs"));
-var path4 = __toESM(require("path"));
+var fs5 = __toESM(require("fs"));
+var path6 = __toESM(require("path"));
 
 // src/deploy.ts
-var fs3 = __toESM(require("fs"));
-var path3 = __toESM(require("path"));
+var fs4 = __toESM(require("fs"));
+var path5 = __toESM(require("path"));
+
+// src/platform.ts
+var os = __toESM(require("os"));
+var path = __toESM(require("path"));
+function hostPlatform() {
+  if (process.platform === "win32") return "win32";
+  if (process.platform === "darwin") return "darwin";
+  if (process.platform === "linux") return "linux";
+  return "other";
+}
+function homeDir() {
+  return os.homedir() || process.env.HOME || process.env.USERPROFILE || "";
+}
+function defaultBrowserChannel() {
+  return hostPlatform() === "win32" ? "msedge" : "chromium";
+}
+function platformLabel() {
+  switch (hostPlatform()) {
+    case "win32":
+      return "Windows";
+    case "darwin":
+      return "macOS";
+    case "linux":
+      return "Linux";
+    default:
+      return process.platform;
+  }
+}
+function schedulerLabel() {
+  switch (hostPlatform()) {
+    case "win32":
+      return "Task Scheduler";
+    case "darwin":
+      return "launchd (LaunchAgent)";
+    case "linux":
+      return "cron";
+    default:
+      return "background scheduler";
+  }
+}
+function shellQuotePosix(value) {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+function shellQuotePowerShell(value) {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+function venvPythonCandidates(root) {
+  return [
+    path.join(root, ".venv", "Scripts", "python.exe"),
+    path.join(root, ".venv", "bin", "python3"),
+    path.join(root, ".venv", "bin", "python")
+  ];
+}
+function sanitizeJobName(name) {
+  const cleaned = (name || "ZoomNotesSync").replace(/[^A-Za-z0-9._-]+/g, "-");
+  return cleaned || "ZoomNotesSync";
+}
 
 // src/paths.ts
 var fs = __toESM(require("fs"));
-var path = __toESM(require("path"));
+var path2 = __toESM(require("path"));
 function expandPath(raw) {
   if (!raw) return "";
   let p = raw.trim();
   if (p.startsWith("~")) {
-    const home = process.env.USERPROFILE || process.env.HOME || "";
-    p = path.join(home, p.slice(1).replace(/^[\\/]/, ""));
+    const home = homeDir();
+    p = path2.join(home, p.slice(1).replace(/^[\\/]/, ""));
   }
-  return path.normalize(p);
+  return path2.normalize(p);
 }
 function pathExists(p) {
   try {
@@ -78,35 +135,30 @@ function resolveSyncRoot(settings) {
 }
 function resolvePython(settings) {
   const explicit = expandPath(settings.pythonPath);
-  if (explicit && isFile(explicit)) return explicit;
+  if (explicit && (isFile(explicit) || pathExists(explicit))) return explicit;
   const root = resolveSyncRoot(settings);
   if (root) {
-    const candidates = [
-      path.join(root, ".venv", "Scripts", "python.exe"),
-      path.join(root, ".venv", "bin", "python"),
-      path.join(root, ".venv", "bin", "python3")
-    ];
-    for (const c of candidates) {
-      if (isFile(c)) return c;
+    for (const c of venvPythonCandidates(root)) {
+      if (isFile(c) || pathExists(c)) return c;
     }
   }
   return process.platform === "win32" ? "python" : "python3";
 }
 function resolveTranscriptsDir(settings, vaultPath) {
   const folder = (settings.outputFolder || "mynotes").replace(/^[\\/]+/, "");
-  return path.normalize(path.join(vaultPath, folder));
+  return path2.normalize(path2.join(vaultPath, folder));
 }
 function looksLikeSyncRoot(root) {
   if (!isDir(root)) return false;
-  return isFile(path.join(root, "sync.py")) && isFile(path.join(root, "config.py")) && isFile(path.join(root, "requirements.txt"));
+  return isFile(path2.join(root, "sync.py")) && isFile(path2.join(root, "config.py")) && isFile(path2.join(root, "requirements.txt"));
 }
 function latestLogPath(root) {
-  const logs = path.join(root, "logs");
+  const logs = path2.join(root, "logs");
   if (!isDir(logs)) return null;
   let best = null;
   for (const name of fs.readdirSync(logs)) {
     if (!/^sync-\d{8}\.log$/i.test(name)) continue;
-    const full = path.join(logs, name);
+    const full = path2.join(logs, name);
     try {
       const st = fs.statSync(full);
       if (!best || st.mtimeMs > best.mtime) {
@@ -127,24 +179,36 @@ function readTail(filePath, maxBytes = 6e3) {
   }
 }
 
+// src/schedule.ts
+var fs3 = __toESM(require("fs"));
+var path4 = __toESM(require("path"));
+
 // src/runner.ts
 var import_child_process = require("child_process");
 var fs2 = __toESM(require("fs"));
-var path2 = __toESM(require("path"));
+var path3 = __toESM(require("path"));
 var active = null;
 function isRunning() {
   return active !== null;
 }
 function cancelActive() {
   if (!active) return false;
+  const child = active;
+  const pid = child.pid;
   try {
-    if (process.platform === "win32" && active.pid) {
-      (0, import_child_process.spawn)("taskkill", ["/pid", String(active.pid), "/T", "/F"], {
+    if (hostPlatform() === "win32" && pid) {
+      (0, import_child_process.spawn)("taskkill", ["/pid", String(pid), "/T", "/F"], {
         windowsHide: true,
         stdio: "ignore"
       });
-    } else {
-      active.kill("SIGTERM");
+    } else if (pid) {
+      child.kill("SIGTERM");
+      setTimeout(() => {
+        try {
+          if (!child.killed) child.kill("SIGKILL");
+        } catch {
+        }
+      }, 3e3);
     }
   } catch {
   }
@@ -158,6 +222,7 @@ function buildEnv(settings, vaultPath, extra) {
     ZOOM_TRANSCRIPTS_DIR: transcripts,
     ZOOM_HEADLESS: settings.headless ? "1" : "0",
     ZOOM_LOG_TITLES: settings.logTitles ? "1" : "0",
+    ZOOM_BROWSER_CHANNEL: process.env.ZOOM_BROWSER_CHANNEL || defaultBrowserChannel(),
     PYTHONUNBUFFERED: "1",
     ...extra
   };
@@ -167,7 +232,7 @@ async function runProcess(opts) {
     throw new Error("Another Zoom sync process is already running");
   }
   const root = resolveSyncRoot(opts.settings);
-  const cwd = opts.cwd || root;
+  const cwd = opts.cwd || root || process.cwd();
   const command = opts.command || resolvePython(opts.settings);
   const args = opts.args ?? [];
   const env = buildEnv(opts.settings, opts.vaultPath, opts.env);
@@ -247,7 +312,7 @@ async function runSync(settings, vaultPath, onLine) {
     settings,
     vaultPath,
     command: py,
-    args: [path2.join(root, "sync.py")],
+    args: [path3.join(root, "sync.py")],
     cwd: root,
     timeoutMs: 25 * 60 * 1e3,
     onLine
@@ -264,9 +329,8 @@ async function runLogin(settings, vaultPath, onLine) {
     settings,
     vaultPath,
     command: py,
-    args: [path2.join(root, "login.py")],
+    args: [path3.join(root, "login.py")],
     cwd: root,
-    // Login is interactive; leave headless off via env override
     env: { ZOOM_HEADLESS: "0" },
     timeoutMs: 15 * 60 * 1e3,
     onLine
@@ -277,7 +341,7 @@ async function runSetupVenv(settings, vaultPath, systemPython, onLine) {
   if (!looksLikeSyncRoot(root)) {
     throw new Error(`Invalid sync root: ${root || "(empty)"}`);
   }
-  const venvDir = path2.join(root, ".venv");
+  const venvDir = path3.join(root, ".venv");
   return runProcess({
     kind: "setup-venv",
     settings,
@@ -292,7 +356,7 @@ async function runSetupVenv(settings, vaultPath, systemPython, onLine) {
 async function runPipInstall(settings, vaultPath, onLine) {
   const root = resolveSyncRoot(settings);
   const py = resolvePython(settings);
-  const req = path2.join(root, "requirements.txt");
+  const req = path3.join(root, "requirements.txt");
   if (!fs2.existsSync(req)) throw new Error(`Missing ${req}`);
   return runProcess({
     kind: "pip-install",
@@ -305,33 +369,6 @@ async function runPipInstall(settings, vaultPath, onLine) {
     onLine
   });
 }
-async function runRegisterTask(settings, vaultPath, onLine) {
-  const root = resolveSyncRoot(settings);
-  const script = path2.join(root, "scripts", "register-task.ps1");
-  if (!fs2.existsSync(script)) {
-    throw new Error(`Missing ${script}`);
-  }
-  const ps = process.env.SystemRoot ? path2.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe") : "powershell.exe";
-  return runProcess({
-    kind: "register-task",
-    settings,
-    vaultPath,
-    command: ps,
-    args: [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      script
-    ],
-    cwd: root,
-    env: {
-      ZOOM_TASK_NAME: settings.taskName || "ZoomNotesSync"
-    },
-    timeoutMs: 2 * 60 * 1e3,
-    onLine
-  });
-}
 function exitLabel(code) {
   if (code === null) return "killed";
   if (code === 0) return "ok";
@@ -339,6 +376,281 @@ function exitLabel(code) {
   if (code === 2) return "degraded";
   if (code === 3) return "locked";
   return `exit ${code}`;
+}
+
+// src/schedule.ts
+var CRON_BEGIN = "# BEGIN zoom-mynotes-sync";
+var CRON_END = "# END zoom-mynotes-sync";
+function writeLocalEnvFiles(settings, vaultPath) {
+  const root = resolveSyncRoot(settings);
+  const out = resolveTranscriptsDir(settings, vaultPath);
+  const py = resolvePython(settings);
+  const channel = defaultBrowserChannel();
+  const syncPy = path4.join(root, "sync.py");
+  const envSh = path4.join(root, "local-env.sh");
+  const envPs1 = path4.join(root, "local-env.ps1");
+  const runSh = path4.join(root, "run-sync.sh");
+  const runPs1 = path4.join(root, "run-sync.ps1");
+  const shBody = `# Generated by Zoom MyNotes Sync Obsidian plugin \u2014 do not commit secrets.
+export ZOOM_TRANSCRIPTS_DIR=${shellQuotePosix(out)}
+export ZOOM_HEADLESS=\${ZOOM_HEADLESS:-1}
+export ZOOM_LOG_TITLES=\${ZOOM_LOG_TITLES:-0}
+export ZOOM_BROWSER_CHANNEL=\${ZOOM_BROWSER_CHANNEL:-${channel}}
+export PYTHONUNBUFFERED=1
+`;
+  const psBody = `# Generated by Zoom MyNotes Sync Obsidian plugin \u2014 do not commit secrets.
+$env:ZOOM_TRANSCRIPTS_DIR = ${shellQuotePowerShell(out)}
+if (-not $env:ZOOM_HEADLESS) { $env:ZOOM_HEADLESS = '1' }
+if (-not $env:ZOOM_LOG_TITLES) { $env:ZOOM_LOG_TITLES = '0' }
+if (-not $env:ZOOM_BROWSER_CHANNEL) { $env:ZOOM_BROWSER_CHANNEL = '${channel}' }
+$env:PYTHONUNBUFFERED = '1'
+`;
+  const runShBody = `#!/usr/bin/env bash
+set -euo pipefail
+ROOT=${shellQuotePosix(root)}
+cd "$ROOT"
+# shellcheck disable=SC1091
+source "$ROOT/local-env.sh"
+exec ${shellQuotePosix(py)} ${shellQuotePosix(syncPy)}
+`;
+  const runPsBody = `$ErrorActionPreference = 'Stop'
+$Root = ${shellQuotePowerShell(root)}
+Set-Location -LiteralPath $Root
+. (Join-Path $Root 'local-env.ps1')
+& ${shellQuotePowerShell(py)} ${shellQuotePowerShell(syncPy)}
+exit $LASTEXITCODE
+`;
+  fs3.writeFileSync(envSh, shBody, "utf8");
+  fs3.writeFileSync(envPs1, psBody, "utf8");
+  fs3.writeFileSync(runSh, runShBody, { encoding: "utf8", mode: 493 });
+  fs3.writeFileSync(runPs1, runPsBody, "utf8");
+  try {
+    fs3.chmodSync(runSh, 493);
+    fs3.chmodSync(envSh, 420);
+  } catch {
+  }
+  return { envSh, envPs1, runSh, runPs1 };
+}
+async function registerWindows(ctx, runPs1) {
+  const root = resolveSyncRoot(ctx.settings);
+  const script = path4.join(root, "scripts", "register-task.ps1");
+  const ps = process.env.SystemRoot ? path4.join(
+    process.env.SystemRoot,
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe"
+  ) : "powershell.exe";
+  if (isFile(script)) {
+    return runProcess({
+      kind: "register-task",
+      settings: ctx.settings,
+      vaultPath: ctx.vaultPath,
+      command: ps,
+      args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script],
+      cwd: root,
+      env: {
+        ZOOM_TASK_NAME: ctx.settings.taskName || "ZoomNotesSync"
+      },
+      timeoutMs: 2 * 60 * 1e3,
+      onLine: ctx.onLine
+    });
+  }
+  const name = sanitizeJobName(ctx.settings.taskName);
+  const tr = `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${runPs1}"`;
+  return runProcess({
+    kind: "register-task",
+    settings: ctx.settings,
+    vaultPath: ctx.vaultPath,
+    command: "schtasks",
+    args: [
+      "/Create",
+      "/F",
+      "/TN",
+      name,
+      "/SC",
+      "MINUTE",
+      "/MO",
+      "30",
+      "/TR",
+      tr,
+      "/RL",
+      "LIMITED"
+    ],
+    cwd: root,
+    timeoutMs: 2 * 60 * 1e3,
+    onLine: ctx.onLine
+  });
+}
+async function registerDarwin(ctx, runSh) {
+  const name = sanitizeJobName(ctx.settings.taskName);
+  const label = `com.zoom-mynotes-sync.${name}`;
+  const agentsDir = path4.join(homeDir(), "Library", "LaunchAgents");
+  fs3.mkdirSync(agentsDir, { recursive: true });
+  const plistPath = path4.join(agentsDir, `${label}.plist`);
+  const root = resolveSyncRoot(ctx.settings);
+  const logOut = path4.join(root, "logs", "launchd-stdout.log");
+  const logErr = path4.join(root, "logs", "launchd-stderr.log");
+  fs3.mkdirSync(path4.join(root, "logs"), { recursive: true });
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>${escapeXml(runSh)}</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${escapeXml(root)}</string>
+  <key>StartInterval</key>
+  <integer>1800</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>${escapeXml(logOut)}</string>
+  <key>StandardErrorPath</key>
+  <string>${escapeXml(logErr)}</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
+`;
+  fs3.writeFileSync(plistPath, plist, "utf8");
+  await runProcess({
+    kind: "register-task",
+    settings: ctx.settings,
+    vaultPath: ctx.vaultPath,
+    command: "launchctl",
+    args: ["unload", plistPath],
+    cwd: root,
+    timeoutMs: 3e4,
+    onLine: ctx.onLine
+  }).catch(() => void 0);
+  return runProcess({
+    kind: "register-task",
+    settings: ctx.settings,
+    vaultPath: ctx.vaultPath,
+    command: "launchctl",
+    args: ["load", plistPath],
+    cwd: root,
+    timeoutMs: 3e4,
+    onLine: ctx.onLine
+  });
+}
+async function registerLinux(ctx, runSh) {
+  const root = resolveSyncRoot(ctx.settings);
+  const name = sanitizeJobName(ctx.settings.taskName);
+  const begin = `${CRON_BEGIN} ${name}`;
+  const end = `${CRON_END} ${name}`;
+  const line = `*/30 * * * * /bin/bash ${shellQuotePosix(runSh)} >> ${shellQuotePosix(
+    path4.join(root, "logs", "cron-sync.log")
+  )} 2>&1`;
+  fs3.mkdirSync(path4.join(root, "logs"), { recursive: true });
+  let existing = "";
+  try {
+    const r = await runProcess({
+      kind: "custom",
+      settings: ctx.settings,
+      vaultPath: ctx.vaultPath,
+      command: "crontab",
+      args: ["-l"],
+      cwd: root,
+      timeoutMs: 15e3,
+      onLine: ctx.onLine
+    });
+    if (r.code === 0) existing = r.stdout || "";
+  } catch {
+    existing = "";
+  }
+  const stripped = stripCronBlock(existing, begin, end);
+  const next = (stripped.trimEnd() ? stripped.trimEnd() + "\n" : "") + `${begin}
+${line}
+${end}
+`;
+  const tmp = path4.join(root, ".zoom-mynotes-crontab.tmp");
+  fs3.writeFileSync(tmp, next, "utf8");
+  try {
+    const r = await runProcess({
+      kind: "register-task",
+      settings: ctx.settings,
+      vaultPath: ctx.vaultPath,
+      command: "crontab",
+      args: [tmp],
+      cwd: root,
+      timeoutMs: 15e3,
+      onLine: ctx.onLine
+    });
+    return r;
+  } finally {
+    try {
+      fs3.unlinkSync(tmp);
+    } catch {
+    }
+  }
+}
+function stripCronBlock(src, begin, end) {
+  const lines = src.split(/\r?\n/);
+  const out = [];
+  let skipping = false;
+  for (const line of lines) {
+    if (line.trim() === begin) {
+      skipping = true;
+      continue;
+    }
+    if (line.trim() === end) {
+      skipping = false;
+      continue;
+    }
+    if (!skipping) out.push(line);
+  }
+  while (out.length && out[out.length - 1] === "") out.pop();
+  return out.join("\n") + (out.length ? "\n" : "");
+}
+function escapeXml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+async function runRegisterSchedule(ctx) {
+  const files = writeLocalEnvFiles(ctx.settings, ctx.vaultPath);
+  const platform = hostPlatform();
+  const label = schedulerLabel();
+  if (platform === "win32") {
+    const result = await registerWindows(ctx, files.runPs1);
+    return {
+      result,
+      detail: result.code === 0 ? `${label} job '${sanitizeJobName(ctx.settings.taskName)}' every 30 min` : `Failed to register ${label}`
+    };
+  }
+  if (platform === "darwin") {
+    const result = await registerDarwin(ctx, files.runSh);
+    return {
+      result,
+      detail: result.code === 0 ? `${label}: com.zoom-mynotes-sync.${sanitizeJobName(
+        ctx.settings.taskName
+      )} every 30 min` : `Failed to load LaunchAgent`
+    };
+  }
+  if (platform === "linux") {
+    const result = await registerLinux(ctx, files.runSh);
+    return {
+      result,
+      detail: result.code === 0 ? `${label} entry every 30 min (user crontab)` : `Failed to install crontab entry (is cron available?)`
+    };
+  }
+  return {
+    result: {
+      kind: "register-task",
+      code: 0,
+      signal: null,
+      stdout: "",
+      stderr: "",
+      durationMs: 0,
+      command: "(skip)"
+    },
+    detail: `Background scheduling not automated on ${process.platform}. Use Obsidian auto-sync or run ${files.runSh} manually.`
+  };
 }
 
 // src/deploy.ts
@@ -351,31 +663,34 @@ function initialSteps() {
     step("python", "Find system Python"),
     step("venv", "Create .venv"),
     step("deps", "Install Python packages"),
-    step("playwright", "Verify Playwright + Edge"),
+    step("playwright", `Verify Playwright + browser (${platformLabel()})`),
     step("output", "Prepare transcripts folder"),
     step("auth", "Check Zoom login state"),
-    step("task", "Register Task Scheduler job"),
+    step("task", `Register ${schedulerLabel()} job`),
     step("plugin", "Install plugin into this vault")
   ];
 }
+function emptySettings() {
+  return {
+    syncRoot: "",
+    pythonPath: "",
+    outputFolder: "mynotes",
+    autoSyncMinutes: 0,
+    headless: true,
+    logTitles: false,
+    taskName: "ZoomNotesSync",
+    lastSyncAt: "",
+    lastExitCode: null,
+    lastStatus: ""
+  };
+}
 async function whichPython(onLog) {
-  const candidates = process.platform === "win32" ? ["py", "python", "python3"] : ["python3", "python"];
+  const candidates = hostPlatform() === "win32" ? ["py", "python", "python3"] : ["python3", "python"];
   for (const cmd of candidates) {
     try {
       const result = await runProcess({
         kind: "custom",
-        settings: {
-          syncRoot: "",
-          pythonPath: "",
-          outputFolder: "mynotes",
-          autoSyncMinutes: 0,
-          headless: true,
-          logTitles: false,
-          taskName: "ZoomNotesSync",
-          lastSyncAt: "",
-          lastExitCode: null,
-          lastStatus: ""
-        },
+        settings: emptySettings(),
         vaultPath: process.cwd(),
         command: cmd,
         args: ["-c", "import sys; print(sys.executable)"],
@@ -384,7 +699,9 @@ async function whichPython(onLog) {
         onLine: onLog ? (l) => onLog(l) : void 0
       });
       const line = (result.stdout || "").trim().split(/\r?\n/).filter(Boolean).pop();
-      if (result.code === 0 && line && isFile(line)) return line;
+      if (result.code === 0 && line && (isFile(line) || pathExists(line))) {
+        return line;
+      }
       if (result.code === 0 && line) return line;
     } catch {
     }
@@ -395,6 +712,12 @@ function summarizeResult(r) {
   const out = (r.stdout || r.stderr || "").trim();
   const tail = out.slice(-400);
   return `exit=${r.code} ${tail}`.trim();
+}
+function resolveVenvPython(root) {
+  for (const c of venvPythonCandidates(root)) {
+    if (isFile(c) || pathExists(c)) return c;
+  }
+  return null;
 }
 async function runFullDeploy(ctx) {
   const steps = initialSteps();
@@ -419,20 +742,25 @@ async function runFullDeploy(ctx) {
   }
   set("root", "ok", root);
   set("python", "running", "Searching\u2026");
-  let systemPy = await whichPython(log);
+  const systemPy = await whichPython(log);
   if (!systemPy) {
-    set("python", "fail", "No python/py on PATH. Install Python 3.11+ and retry.");
+    set(
+      "python",
+      "fail",
+      "No python3/python on PATH. Install Python 3.11+ and retry."
+    );
     return steps;
   }
   set("python", "ok", systemPy);
   set("venv", "running", "Creating .venv if needed\u2026");
-  const venvPy = process.platform === "win32" ? path3.join(root, ".venv", "Scripts", "python.exe") : path3.join(root, ".venv", "bin", "python");
-  if (isFile(venvPy)) {
+  let venvPy = resolveVenvPython(root);
+  if (venvPy) {
     set("venv", "ok", `Exists: ${venvPy}`);
   } else {
     try {
       const r = await runSetupVenv(ctx.settings, ctx.vaultPath, systemPy, log);
-      if (r.code !== 0 || !isFile(venvPy)) {
+      venvPy = resolveVenvPython(root);
+      if (r.code !== 0 || !venvPy) {
         set("venv", "fail", summarizeResult(r));
         return steps;
       }
@@ -455,7 +783,8 @@ async function runFullDeploy(ctx) {
     set("deps", "fail", e instanceof Error ? e.message : String(e));
     return steps;
   }
-  set("playwright", "running", "import playwright\u2026");
+  const channel = defaultBrowserChannel();
+  set("playwright", "running", `import playwright + ensure ${channel}\u2026`);
   try {
     const py = resolvePython(ctx.settings);
     const r = await runProcess({
@@ -465,7 +794,7 @@ async function runFullDeploy(ctx) {
       command: py,
       args: [
         "-c",
-        "import playwright; print('playwright', playwright.__version__ if hasattr(playwright,'__version__') else 'ok')"
+        "import playwright; print('playwright ok')"
       ],
       cwd: root,
       timeoutMs: 3e4,
@@ -475,11 +804,30 @@ async function runFullDeploy(ctx) {
       set("playwright", "fail", summarizeResult(r));
       return steps;
     }
-    set(
-      "playwright",
-      "ok",
-      `${(r.stdout || "").trim() || "ok"} (uses installed Edge via ZOOM_BROWSER_CHANNEL=msedge)`
-    );
+    const installArgs = channel === "msedge" ? ["-m", "playwright", "install", "msedge"] : ["-m", "playwright", "install", "chromium"];
+    const ir = await runProcess({
+      kind: "custom",
+      settings: ctx.settings,
+      vaultPath: ctx.vaultPath,
+      command: py,
+      args: installArgs,
+      cwd: root,
+      timeoutMs: 10 * 60 * 1e3,
+      onLine: log
+    });
+    if (ir.code !== 0) {
+      set(
+        "playwright",
+        "ok",
+        `playwright import ok; browser install exited ${ir.code}. Set ZOOM_BROWSER_CHANNEL if needed (default ${channel}). ` + (hostPlatform() === "win32" ? "Edge recommended on Windows." : "Chromium will be used on macOS/Linux.")
+      );
+    } else {
+      set(
+        "playwright",
+        "ok",
+        `playwright ok; channel=${channel} (${platformLabel()})`
+      );
+    }
   } catch (e) {
     set("playwright", "fail", e instanceof Error ? e.message : String(e));
     return steps;
@@ -487,74 +835,78 @@ async function runFullDeploy(ctx) {
   set("output", "running", "Creating transcripts folder\u2026");
   try {
     const out = resolveTranscriptsDir(ctx.settings, ctx.vaultPath);
-    fs3.mkdirSync(out, { recursive: true });
-    const envPs1 = path3.join(root, "local-env.ps1");
-    const escaped = out.replace(/'/g, "''");
-    const body = `# Generated by Zoom MyNotes Sync Obsidian plugin \u2014 do not commit secrets.
-$env:ZOOM_TRANSCRIPTS_DIR = '${escaped}'
-`;
-    fs3.writeFileSync(envPs1, body, "utf8");
-    set("output", "ok", `${out}
-(wrote local-env.ps1 for scheduled runs)`);
+    fs4.mkdirSync(out, { recursive: true });
+    const files = writeLocalEnvFiles(ctx.settings, ctx.vaultPath);
+    set(
+      "output",
+      "ok",
+      `${out}
+(wrote ${path5.basename(files.envSh)}, ${path5.basename(
+        files.envPs1
+      )}, ${path5.basename(files.runSh)}, ${path5.basename(files.runPs1)})`
+    );
   } catch (e) {
     set("output", "fail", e instanceof Error ? e.message : String(e));
     return steps;
   }
   set("auth", "running", "Checking storage_state.json\u2026");
-  const state = path3.join(root, "storage_state.json");
+  const state = path5.join(root, "storage_state.json");
   if (isFile(state)) {
     set("auth", "ok", `Session present: ${state}`);
   } else {
     set(
       "auth",
       "skip",
-      "No storage_state.json yet \u2014 run command \u201CZoom Sync: Login\u201D once after deploy."
+      "No storage_state.json yet \u2014 run command \u201CLogin (interactive SSO)\u201D once after deploy."
     );
   }
-  if (process.platform !== "win32") {
-    set("task", "skip", "Task Scheduler registration is Windows-only.");
-  } else {
-    set("task", "running", "Registering scheduled task\u2026");
-    try {
-      const r = await runRegisterTask(ctx.settings, ctx.vaultPath, log);
-      if (r.code !== 0) {
-        set("task", "fail", summarizeResult(r));
-      } else {
-        set(
-          "task",
-          "ok",
-          `Task '${ctx.settings.taskName || "ZoomNotesSync"}' registered (every 30 min, logged-on).`
-        );
-      }
-    } catch (e) {
-      set("task", "fail", e instanceof Error ? e.message : String(e));
+  set("task", "running", `Registering ${schedulerLabel()}\u2026`);
+  try {
+    const { result, detail } = await runRegisterSchedule({
+      settings: ctx.settings,
+      vaultPath: ctx.vaultPath,
+      onLine: log
+    });
+    if (hostPlatform() === "other") {
+      set("task", "skip", detail);
+    } else if (result.code !== 0) {
+      set("task", "fail", `${detail}
+${summarizeResult(result)}`);
+    } else {
+      set("task", "ok", detail);
     }
+  } catch (e) {
+    set("task", "fail", e instanceof Error ? e.message : String(e));
   }
   set("plugin", "running", "Copying plugin into .obsidian/plugins\u2026");
   try {
-    const dest = path3.join(
+    const dest = path5.join(
       ctx.vaultPath,
       ".obsidian",
       "plugins",
       "zoom-mynotes-sync"
     );
-    fs3.mkdirSync(dest, { recursive: true });
+    fs4.mkdirSync(dest, { recursive: true });
     const files = ["main.js", "manifest.json", "styles.css"];
     const srcDir = ctx.pluginDir;
     const copied = [];
     for (const f of files) {
-      const from = path3.join(srcDir, f);
+      const from = path5.join(srcDir, f);
       if (!pathExists(from)) {
         throw new Error(`Missing build artifact: ${from}`);
       }
-      fs3.copyFileSync(from, path3.join(dest, f));
+      fs4.copyFileSync(from, path5.join(dest, f));
       copied.push(f);
     }
-    const community = path3.join(ctx.vaultPath, ".obsidian", "community-plugins.json");
+    const community = path5.join(
+      ctx.vaultPath,
+      ".obsidian",
+      "community-plugins.json"
+    );
     let list = [];
     if (isFile(community)) {
       try {
-        list = JSON.parse(fs3.readFileSync(community, "utf8"));
+        list = JSON.parse(fs4.readFileSync(community, "utf8"));
         if (!Array.isArray(list)) list = [];
       } catch {
         list = [];
@@ -562,7 +914,7 @@ $env:ZOOM_TRANSCRIPTS_DIR = '${escaped}'
     }
     if (!list.includes("zoom-mynotes-sync")) {
       list.push("zoom-mynotes-sync");
-      fs3.writeFileSync(community, JSON.stringify(list, null, 2) + "\n", "utf8");
+      fs4.writeFileSync(community, JSON.stringify(list, null, 2) + "\n", "utf8");
     }
     set(
       "plugin",
@@ -576,9 +928,9 @@ $env:ZOOM_TRANSCRIPTS_DIR = '${escaped}'
 }
 function detectDefaultSyncRoot(pluginDir) {
   const candidates = [
-    path3.resolve(pluginDir, ".."),
-    path3.resolve(pluginDir, "..", ".."),
-    path3.resolve(pluginDir, "..", "..", "..")
+    path5.resolve(pluginDir, ".."),
+    path5.resolve(pluginDir, "..", ".."),
+    path5.resolve(pluginDir, "..", "..", "..")
   ];
   for (const c of candidates) {
     if (looksLikeSyncRoot(c)) return c;
@@ -594,9 +946,8 @@ function deploySummary(steps) {
 }
 
 // src/settings.ts
-var DEFAULT_SYNC_ROOT = process.platform === "win32" ? "C:\\Users\\DaemonBehr\\local-repo\\zoom-mynotes-sync" : "";
 var DEFAULT_SETTINGS = {
-  syncRoot: DEFAULT_SYNC_ROOT,
+  syncRoot: "",
   pythonPath: "",
   outputFolder: "mynotes",
   autoSyncMinutes: 0,
@@ -697,15 +1048,15 @@ var ZoomMyNotesSyncPlugin = class extends import_obsidian.Plugin {
   pluginSourceDir() {
     const dir = this.manifest.dir;
     if (dir) {
-      const abs = path4.join(this.vaultPath(), dir);
-      if (isFile(path4.join(abs, "main.js"))) return abs;
+      const abs = path6.join(this.vaultPath(), dir);
+      if (isFile(path6.join(abs, "main.js"))) return abs;
     }
     const root = resolveSyncRoot(this.settings);
     if (root) {
-      const dev = path4.join(root, "Zoom-MyNotes-Obsidian-plugin");
-      if (isFile(path4.join(dev, "main.js"))) return dev;
+      const dev = path6.join(root, "Zoom-MyNotes-Obsidian-plugin");
+      if (isFile(path6.join(dev, "main.js"))) return dev;
     }
-    return dir ? path4.join(this.vaultPath(), dir) : "";
+    return dir ? path6.join(this.vaultPath(), dir) : "";
   }
   rescheduleAutoSync() {
     if (this.autoTimer !== null) {
@@ -827,7 +1178,7 @@ var ZoomMyNotesSyncPlugin = class extends import_obsidian.Plugin {
   openTranscriptsFolder() {
     try {
       const dir = resolveTranscriptsDir(this.settings, this.vaultPath());
-      fs4.mkdirSync(dir, { recursive: true });
+      fs5.mkdirSync(dir, { recursive: true });
       const rel = (0, import_obsidian.normalizePath)(this.settings.outputFolder || "mynotes");
       const folder = this.app.vault.getAbstractFileByPath(rel);
       if (folder) {
@@ -852,12 +1203,16 @@ var ZoomSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       text: "Controls the Python + Playwright backend that downloads Zoom AI notes transcripts into this vault."
     });
     new import_obsidian.Setting(containerEl).setName("Sync repo path").setDesc("Absolute path to the zoom-mynotes-sync repository (contains sync.py).").addText(
-      (t) => t.setPlaceholder("C:\\Users\\\u2026\\zoom-mynotes-sync").setValue(this.plugin.settings.syncRoot).onChange(async (v) => {
+      (t) => t.setPlaceholder(
+        process.platform === "win32" ? "C:\\Users\\\u2026\\zoom-mynotes-sync" : "/Users/\u2026/zoom-mynotes-sync"
+      ).setValue(this.plugin.settings.syncRoot).onChange(async (v) => {
         this.plugin.settings.syncRoot = v.trim();
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Python path").setDesc("Optional. Leave empty to use <repo>\\.venv\\Scripts\\python.exe.").addText(
+    new import_obsidian.Setting(containerEl).setName("Python path").setDesc(
+      "Optional. Leave empty to use .venv (Windows: Scripts/python.exe, macOS/Linux: bin/python3)."
+    ).addText(
       (t) => t.setPlaceholder("(auto)").setValue(this.plugin.settings.pythonPath).onChange(async (v) => {
         this.plugin.settings.pythonPath = v.trim();
         await this.plugin.saveSettings();
@@ -881,20 +1236,26 @@ var ZoomSyncSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Auto-sync while Obsidian is open").setDesc("Minutes between syncs (0 = disabled). Task Scheduler still covers background.").addText(
+    new import_obsidian.Setting(containerEl).setName("Auto-sync while Obsidian is open").setDesc(
+      "Minutes between syncs (0 = disabled). OS background job (Task Scheduler / launchd / cron) still covers when Obsidian is closed."
+    ).addText(
       (t) => t.setPlaceholder("0").setValue(String(this.plugin.settings.autoSyncMinutes || 0)).onChange(async (v) => {
         const n = parseInt(v.trim(), 10);
         this.plugin.settings.autoSyncMinutes = Number.isFinite(n) && n > 0 ? n : 0;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Scheduled task name").setDesc("Windows Task Scheduler task created by the deploy wizard.").addText(
+    new import_obsidian.Setting(containerEl).setName("Background job name").setDesc(
+      "Name used by the deploy wizard: Windows Task Scheduler, macOS LaunchAgent, or Linux cron marker."
+    ).addText(
       (t) => t.setPlaceholder("ZoomNotesSync").setValue(this.plugin.settings.taskName).onChange(async (v) => {
         this.plugin.settings.taskName = v.trim() || "ZoomNotesSync";
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Deploy wizard").setDesc("Create venv, install deps, register Task Scheduler, install plugin into vault.").addButton(
+    new import_obsidian.Setting(containerEl).setName("Deploy wizard").setDesc(
+      "Create venv, install deps, register OS background job, install plugin into vault."
+    ).addButton(
       (b) => b.setButtonText("Open deploy wizard").setCta().onClick(() => {
         new DeployModal(this.app, this.plugin).open();
       })
@@ -932,7 +1293,7 @@ var DeployModal = class extends import_obsidian.Modal {
     contentEl.addClass("zoom-deploy-modal");
     contentEl.createEl("h2", { text: "Zoom MyNotes deploy wizard" });
     contentEl.createEl("p", {
-      text: "Sets up the Python backend, vault output folder, Windows scheduled task, and this plugin."
+      text: "Sets up the Python backend, vault output folder, OS background job (Task Scheduler / launchd / cron), and this plugin. Works on Windows, macOS, and Linux."
     });
     this.stepsEl = contentEl.createDiv();
     this.renderSteps([]);

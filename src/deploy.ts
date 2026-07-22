@@ -1,6 +1,13 @@
 import * as fs from "fs";
 import * as path from "path";
 import {
+  defaultBrowserChannel,
+  hostPlatform,
+  platformLabel,
+  schedulerLabel,
+  venvPythonCandidates,
+} from "./platform";
+import {
   isDir,
   isFile,
   looksLikeSyncRoot,
@@ -9,11 +16,11 @@ import {
   resolveSyncRoot,
   resolveTranscriptsDir,
 } from "./paths";
+import { runRegisterSchedule, writeLocalEnvFiles } from "./schedule";
 import type { ZoomSyncSettings } from "./settings";
 import {
   runPipInstall,
   runProcess,
-  runRegisterTask,
   runSetupVenv,
   type RunResult,
 } from "./runner";
@@ -61,35 +68,39 @@ export function initialSteps(): DeployStep[] {
     step("python", "Find system Python"),
     step("venv", "Create .venv"),
     step("deps", "Install Python packages"),
-    step("playwright", "Verify Playwright + Edge"),
+    step("playwright", `Verify Playwright + browser (${platformLabel()})`),
     step("output", "Prepare transcripts folder"),
     step("auth", "Check Zoom login state"),
-    step("task", "Register Task Scheduler job"),
+    step("task", `Register ${schedulerLabel()} job`),
     step("plugin", "Install plugin into this vault"),
   ];
 }
 
+function emptySettings(): ZoomSyncSettings {
+  return {
+    syncRoot: "",
+    pythonPath: "",
+    outputFolder: "mynotes",
+    autoSyncMinutes: 0,
+    headless: true,
+    logTitles: false,
+    taskName: "ZoomNotesSync",
+    lastSyncAt: "",
+    lastExitCode: null,
+    lastStatus: "",
+  };
+}
+
 async function whichPython(onLog?: (s: string) => void): Promise<string | null> {
   const candidates =
-    process.platform === "win32"
+    hostPlatform() === "win32"
       ? ["py", "python", "python3"]
       : ["python3", "python"];
   for (const cmd of candidates) {
     try {
       const result = await runProcess({
         kind: "custom",
-        settings: {
-          syncRoot: "",
-          pythonPath: "",
-          outputFolder: "mynotes",
-          autoSyncMinutes: 0,
-          headless: true,
-          logTitles: false,
-          taskName: "ZoomNotesSync",
-          lastSyncAt: "",
-          lastExitCode: null,
-          lastStatus: "",
-        },
+        settings: emptySettings(),
         vaultPath: process.cwd(),
         command: cmd,
         args: ["-c", "import sys; print(sys.executable)"],
@@ -97,9 +108,14 @@ async function whichPython(onLog?: (s: string) => void): Promise<string | null> 
         timeoutMs: 15_000,
         onLine: onLog ? (l) => onLog(l) : undefined,
       });
-      const line = (result.stdout || "").trim().split(/\r?\n/).filter(Boolean).pop();
-      if (result.code === 0 && line && isFile(line)) return line;
-      // py launcher may print path without being the file itself on some setups
+      const line = (result.stdout || "")
+        .trim()
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .pop();
+      if (result.code === 0 && line && (isFile(line) || pathExists(line))) {
+        return line;
+      }
       if (result.code === 0 && line) return line;
     } catch {
       /* try next */
@@ -112,6 +128,13 @@ function summarizeResult(r: RunResult): string {
   const out = (r.stdout || r.stderr || "").trim();
   const tail = out.slice(-400);
   return `exit=${r.code} ${tail}`.trim();
+}
+
+function resolveVenvPython(root: string): string | null {
+  for (const c of venvPythonCandidates(root)) {
+    if (isFile(c) || pathExists(c)) return c;
+  }
+  return null;
 }
 
 export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
@@ -141,25 +164,27 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
 
   // 2. System python
   set("python", "running", "Searching…");
-  let systemPy = await whichPython(log);
+  const systemPy = await whichPython(log);
   if (!systemPy) {
-    set("python", "fail", "No python/py on PATH. Install Python 3.11+ and retry.");
+    set(
+      "python",
+      "fail",
+      "No python3/python on PATH. Install Python 3.11+ and retry."
+    );
     return steps;
   }
   set("python", "ok", systemPy);
 
   // 3. Venv
   set("venv", "running", "Creating .venv if needed…");
-  const venvPy =
-    process.platform === "win32"
-      ? path.join(root, ".venv", "Scripts", "python.exe")
-      : path.join(root, ".venv", "bin", "python");
-  if (isFile(venvPy)) {
+  let venvPy = resolveVenvPython(root);
+  if (venvPy) {
     set("venv", "ok", `Exists: ${venvPy}`);
   } else {
     try {
       const r = await runSetupVenv(ctx.settings, ctx.vaultPath, systemPy, log);
-      if (r.code !== 0 || !isFile(venvPy)) {
+      venvPy = resolveVenvPython(root);
+      if (r.code !== 0 || !venvPy) {
         set("venv", "fail", summarizeResult(r));
         return steps;
       }
@@ -170,7 +195,6 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
     }
   }
 
-  // Point settings at venv python for remaining steps
   ctx.settings.pythonPath = venvPy;
 
   // 4. pip install
@@ -187,8 +211,9 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
     return steps;
   }
 
-  // 5. Playwright import + channel note
-  set("playwright", "running", "import playwright…");
+  // 5. Playwright + browser bits
+  const channel = defaultBrowserChannel();
+  set("playwright", "running", `import playwright + ensure ${channel}…`);
   try {
     const py = resolvePython(ctx.settings);
     const r = await runProcess({
@@ -198,7 +223,7 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
       command: py,
       args: [
         "-c",
-        "import playwright; print('playwright', playwright.__version__ if hasattr(playwright,'__version__') else 'ok')",
+        "import playwright; print('playwright ok')",
       ],
       cwd: root,
       timeoutMs: 30_000,
@@ -208,28 +233,58 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
       set("playwright", "fail", summarizeResult(r));
       return steps;
     }
-    set(
-      "playwright",
-      "ok",
-      `${(r.stdout || "").trim() || "ok"} (uses installed Edge via ZOOM_BROWSER_CHANNEL=msedge)`
-    );
+
+    // Install browser binaries for the preferred channel (no-op if already present).
+    const installArgs =
+      channel === "msedge"
+        ? ["-m", "playwright", "install", "msedge"]
+        : ["-m", "playwright", "install", "chromium"];
+    const ir = await runProcess({
+      kind: "custom",
+      settings: ctx.settings,
+      vaultPath: ctx.vaultPath,
+      command: py,
+      args: installArgs,
+      cwd: root,
+      timeoutMs: 10 * 60 * 1000,
+      onLine: log,
+    });
+    if (ir.code !== 0) {
+      // Soft-fail: user may already have a system browser Playwright can attach to.
+      set(
+        "playwright",
+        "ok",
+        `playwright import ok; browser install exited ${ir.code}. ` +
+          `Set ZOOM_BROWSER_CHANNEL if needed (default ${channel}). ` +
+          (hostPlatform() === "win32"
+            ? "Edge recommended on Windows."
+            : "Chromium will be used on macOS/Linux.")
+      );
+    } else {
+      set(
+        "playwright",
+        "ok",
+        `playwright ok; channel=${channel} (${platformLabel()})`
+      );
+    }
   } catch (e) {
     set("playwright", "fail", e instanceof Error ? e.message : String(e));
     return steps;
   }
 
-  // 6. Output folder + local-env.ps1 for Task Scheduler / run.ps1
+  // 6. Output folder + portable env/run scripts
   set("output", "running", "Creating transcripts folder…");
   try {
     const out = resolveTranscriptsDir(ctx.settings, ctx.vaultPath);
     fs.mkdirSync(out, { recursive: true });
-    const envPs1 = path.join(root, "local-env.ps1");
-    const escaped = out.replace(/'/g, "''");
-    const body =
-      `# Generated by Zoom MyNotes Sync Obsidian plugin — do not commit secrets.\n` +
-      `$env:ZOOM_TRANSCRIPTS_DIR = '${escaped}'\n`;
-    fs.writeFileSync(envPs1, body, "utf8");
-    set("output", "ok", `${out}\n(wrote local-env.ps1 for scheduled runs)`);
+    const files = writeLocalEnvFiles(ctx.settings, ctx.vaultPath);
+    set(
+      "output",
+      "ok",
+      `${out}\n(wrote ${path.basename(files.envSh)}, ${path.basename(
+        files.envPs1
+      )}, ${path.basename(files.runSh)}, ${path.basename(files.runPs1)})`
+    );
   } catch (e) {
     set("output", "fail", e instanceof Error ? e.message : String(e));
     return steps;
@@ -244,29 +299,27 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
     set(
       "auth",
       "skip",
-      "No storage_state.json yet — run command “Zoom Sync: Login” once after deploy."
+      "No storage_state.json yet — run command “Login (interactive SSO)” once after deploy."
     );
   }
 
-  // 8. Task Scheduler (Windows only)
-  if (process.platform !== "win32") {
-    set("task", "skip", "Task Scheduler registration is Windows-only.");
-  } else {
-    set("task", "running", "Registering scheduled task…");
-    try {
-      const r = await runRegisterTask(ctx.settings, ctx.vaultPath, log);
-      if (r.code !== 0) {
-        set("task", "fail", summarizeResult(r));
-      } else {
-        set(
-          "task",
-          "ok",
-          `Task '${ctx.settings.taskName || "ZoomNotesSync"}' registered (every 30 min, logged-on).`
-        );
-      }
-    } catch (e) {
-      set("task", "fail", e instanceof Error ? e.message : String(e));
+  // 8. Background schedule (Windows / macOS / Linux)
+  set("task", "running", `Registering ${schedulerLabel()}…`);
+  try {
+    const { result, detail } = await runRegisterSchedule({
+      settings: ctx.settings,
+      vaultPath: ctx.vaultPath,
+      onLine: log,
+    });
+    if (hostPlatform() === "other") {
+      set("task", "skip", detail);
+    } else if (result.code !== 0) {
+      set("task", "fail", `${detail}\n${summarizeResult(result)}`);
+    } else {
+      set("task", "ok", detail);
     }
+  } catch (e) {
+    set("task", "fail", e instanceof Error ? e.message : String(e));
   }
 
   // 9. Install plugin files into vault
@@ -290,8 +343,11 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
       fs.copyFileSync(from, path.join(dest, f));
       copied.push(f);
     }
-    // Enable in community-plugins.json
-    const community = path.join(ctx.vaultPath, ".obsidian", "community-plugins.json");
+    const community = path.join(
+      ctx.vaultPath,
+      ".obsidian",
+      "community-plugins.json"
+    );
     let list: string[] = [];
     if (isFile(community)) {
       try {
@@ -318,7 +374,6 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
 }
 
 export function detectDefaultSyncRoot(pluginDir: string): string {
-  // pluginDir is .../Zoom-MyNotes-Obsidian-plugin or vault/.obsidian/plugins/zoom-mynotes-sync
   const candidates = [
     path.resolve(pluginDir, ".."),
     path.resolve(pluginDir, "..", ".."),

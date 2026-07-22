@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
+import { defaultBrowserChannel, hostPlatform } from "./platform";
 import type { ZoomSyncSettings } from "./settings";
 import {
   looksLikeSyncRoot,
@@ -9,7 +10,13 @@ import {
   resolveTranscriptsDir,
 } from "./paths";
 
-export type RunKind = "sync" | "login" | "setup-venv" | "pip-install" | "register-task" | "custom";
+export type RunKind =
+  | "sync"
+  | "login"
+  | "setup-venv"
+  | "pip-install"
+  | "register-task"
+  | "custom";
 
 export interface RunResult {
   kind: RunKind;
@@ -43,14 +50,23 @@ export function isRunning(): boolean {
 
 export function cancelActive(): boolean {
   if (!active) return false;
+  const child = active;
+  const pid = child.pid;
   try {
-    if (process.platform === "win32" && active.pid) {
-      spawn("taskkill", ["/pid", String(active.pid), "/T", "/F"], {
+    if (hostPlatform() === "win32" && pid) {
+      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
         windowsHide: true,
         stdio: "ignore",
       });
-    } else {
-      active.kill("SIGTERM");
+    } else if (pid) {
+      child.kill("SIGTERM");
+      setTimeout(() => {
+        try {
+          if (!child.killed) child.kill("SIGKILL");
+        } catch {
+          /* ignore */
+        }
+      }, 3000);
     }
   } catch {
     /* ignore */
@@ -70,6 +86,8 @@ function buildEnv(
     ZOOM_TRANSCRIPTS_DIR: transcripts,
     ZOOM_HEADLESS: settings.headless ? "1" : "0",
     ZOOM_LOG_TITLES: settings.logTitles ? "1" : "0",
+    ZOOM_BROWSER_CHANNEL:
+      process.env.ZOOM_BROWSER_CHANNEL || defaultBrowserChannel(),
     PYTHONUNBUFFERED: "1",
     ...extra,
   };
@@ -81,7 +99,7 @@ export async function runProcess(opts: RunOptions): Promise<RunResult> {
   }
 
   const root = resolveSyncRoot(opts.settings);
-  const cwd = opts.cwd || root;
+  const cwd = opts.cwd || root || process.cwd();
   const command = opts.command || resolvePython(opts.settings);
   const args = opts.args ?? [];
   const env = buildEnv(opts.settings, opts.vaultPath, opts.env);
@@ -141,7 +159,6 @@ export async function runProcess(opts: RunOptions): Promise<RunResult> {
           if (line) opts.onLine(line, stream);
         }
       }
-      // Cap buffers
       if (stdout.length > 200_000) stdout = stdout.slice(-150_000);
       if (stderr.length > 200_000) stderr = stderr.slice(-150_000);
     };
@@ -198,7 +215,6 @@ export async function runLogin(
     command: py,
     args: [path.join(root, "login.py")],
     cwd: root,
-    // Login is interactive; leave headless off via env override
     env: { ZOOM_HEADLESS: "0" },
     timeoutMs: 15 * 60 * 1000,
     onLine,
@@ -245,41 +261,6 @@ export async function runPipInstall(
     args: ["-m", "pip", "install", "-r", req],
     cwd: root,
     timeoutMs: 15 * 60 * 1000,
-    onLine,
-  });
-}
-
-export async function runRegisterTask(
-  settings: ZoomSyncSettings,
-  vaultPath: string,
-  onLine?: RunOptions["onLine"]
-): Promise<RunResult> {
-  const root = resolveSyncRoot(settings);
-  const script = path.join(root, "scripts", "register-task.ps1");
-  if (!fs.existsSync(script)) {
-    throw new Error(`Missing ${script}`);
-  }
-  const ps =
-    process.env.SystemRoot
-      ? path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
-      : "powershell.exe";
-  return runProcess({
-    kind: "register-task",
-    settings,
-    vaultPath,
-    command: ps,
-    args: [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      script,
-    ],
-    cwd: root,
-    env: {
-      ZOOM_TASK_NAME: settings.taskName || "ZoomNotesSync",
-    },
-    timeoutMs: 2 * 60 * 1000,
     onLine,
   });
 }

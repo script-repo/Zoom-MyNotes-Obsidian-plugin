@@ -1,12 +1,13 @@
 import * as fs from "fs";
 import * as path from "path";
+import { homeDir, venvPythonCandidates } from "./platform";
 import type { ZoomSyncSettings } from "./settings";
 
 export function expandPath(raw: string): string {
   if (!raw) return "";
   let p = raw.trim();
   if (p.startsWith("~")) {
-    const home = process.env.USERPROFILE || process.env.HOME || "";
+    const home = homeDir();
     p = path.join(home, p.slice(1).replace(/^[\\/]/, ""));
   }
   return path.normalize(p);
@@ -42,17 +43,12 @@ export function resolveSyncRoot(settings: ZoomSyncSettings): string {
 
 export function resolvePython(settings: ZoomSyncSettings): string {
   const explicit = expandPath(settings.pythonPath);
-  if (explicit && isFile(explicit)) return explicit;
+  if (explicit && (isFile(explicit) || pathExists(explicit))) return explicit;
 
   const root = resolveSyncRoot(settings);
   if (root) {
-    const candidates = [
-      path.join(root, ".venv", "Scripts", "python.exe"),
-      path.join(root, ".venv", "bin", "python"),
-      path.join(root, ".venv", "bin", "python3"),
-    ];
-    for (const c of candidates) {
-      if (isFile(c)) return c;
+    for (const c of venvPythonCandidates(root)) {
+      if (isFile(c) || pathExists(c)) return c;
     }
   }
   return process.platform === "win32" ? "python" : "python3";

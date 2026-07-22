@@ -1,7 +1,7 @@
 export interface ZoomSyncSettings {
   /** Absolute path to the zoom-mynotes-sync repo root. */
   syncRoot: string;
-  /** Absolute path to python.exe (empty = auto-detect .venv then PATH). */
+  /** Absolute path to Python (empty = auto-detect .venv then PATH). */
   pythonPath: string;
   /** Vault-relative folder for transcripts (ZOOM_TRANSCRIPTS_DIR). */
   outputFolder: string;
@@ -11,7 +11,12 @@ export interface ZoomSyncSettings {
   headless: boolean;
   /** Log meeting titles (ZOOM_LOG_TITLES). */
   logTitles: boolean;
-  /** Scheduled task name for Windows Task Scheduler. */
+  /**
+   * Background job name:
+   * - Windows Task Scheduler task
+   * - macOS LaunchAgent label suffix
+   * - Linux cron comment marker
+   */
   taskName: string;
   /** Last successful sync ISO timestamp (UI only). */
   lastSyncAt: string;
@@ -21,13 +26,8 @@ export interface ZoomSyncSettings {
   lastStatus: string;
 }
 
-const DEFAULT_SYNC_ROOT =
-  process.platform === "win32"
-    ? "C:\\Users\\DaemonBehr\\local-repo\\zoom-mynotes-sync"
-    : "";
-
 export const DEFAULT_SETTINGS: ZoomSyncSettings = {
-  syncRoot: DEFAULT_SYNC_ROOT,
+  syncRoot: "",
   pythonPath: "",
   outputFolder: "mynotes",
   autoSyncMinutes: 0,

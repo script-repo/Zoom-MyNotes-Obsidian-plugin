@@ -315,7 +315,11 @@ class ZoomSyncSettingTab extends PluginSettingTab {
       .setDesc("Absolute path to the zoom-mynotes-sync repository (contains sync.py).")
       .addText((t) =>
         t
-          .setPlaceholder("C:\\Users\\…\\zoom-mynotes-sync")
+          .setPlaceholder(
+            process.platform === "win32"
+              ? "C:\\Users\\…\\zoom-mynotes-sync"
+              : "/Users/…/zoom-mynotes-sync"
+          )
           .setValue(this.plugin.settings.syncRoot)
           .onChange(async (v) => {
             this.plugin.settings.syncRoot = v.trim();
@@ -325,7 +329,9 @@ class ZoomSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Python path")
-      .setDesc("Optional. Leave empty to use <repo>\\.venv\\Scripts\\python.exe.")
+      .setDesc(
+        "Optional. Leave empty to use .venv (Windows: Scripts/python.exe, macOS/Linux: bin/python3)."
+      )
       .addText((t) =>
         t
           .setPlaceholder("(auto)")
@@ -371,7 +377,9 @@ class ZoomSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Auto-sync while Obsidian is open")
-      .setDesc("Minutes between syncs (0 = disabled). Task Scheduler still covers background.")
+      .setDesc(
+        "Minutes between syncs (0 = disabled). OS background job (Task Scheduler / launchd / cron) still covers when Obsidian is closed."
+      )
       .addText((t) =>
         t
           .setPlaceholder("0")
@@ -384,8 +392,10 @@ class ZoomSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Scheduled task name")
-      .setDesc("Windows Task Scheduler task created by the deploy wizard.")
+      .setName("Background job name")
+      .setDesc(
+        "Name used by the deploy wizard: Windows Task Scheduler, macOS LaunchAgent, or Linux cron marker."
+      )
       .addText((t) =>
         t
           .setPlaceholder("ZoomNotesSync")
@@ -398,7 +408,9 @@ class ZoomSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Deploy wizard")
-      .setDesc("Create venv, install deps, register Task Scheduler, install plugin into vault.")
+      .setDesc(
+        "Create venv, install deps, register OS background job, install plugin into vault."
+      )
       .addButton((b) =>
         b.setButtonText("Open deploy wizard").setCta().onClick(() => {
           new DeployModal(this.app, this.plugin).open();
@@ -447,7 +459,7 @@ class DeployModal extends Modal {
     contentEl.addClass("zoom-deploy-modal");
     contentEl.createEl("h2", { text: "Zoom MyNotes deploy wizard" });
     contentEl.createEl("p", {
-      text: "Sets up the Python backend, vault output folder, Windows scheduled task, and this plugin.",
+      text: "Sets up the Python backend, vault output folder, OS background job (Task Scheduler / launchd / cron), and this plugin. Works on Windows, macOS, and Linux.",
     });
 
     this.stepsEl = contentEl.createDiv();
