@@ -1,0 +1,19 @@
+{
+  "name": "zoom-mynotes-sync",
+  "version": "1.0.0",
+  "description": "Deploy and control Zoom Notes transcript sync from Obsidian",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "install-vault": "node esbuild.config.mjs production && node scripts/install-vault.mjs"
+  },
+  "keywords": ["obsidian", "zoom", "transcripts"],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "esbuild": "^0.25.0",
+    "obsidian": "^1.7.2",
+    "typescript": "^5.7.2"
+  }
+}

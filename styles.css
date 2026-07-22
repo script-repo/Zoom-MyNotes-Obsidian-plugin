@@ -1,0 +1,80 @@
+.zoom-sync-status {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  max-width: 28em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.zoom-sync-status.is-running {
+  color: var(--text-accent);
+}
+
+.zoom-sync-status.is-error {
+  color: var(--text-error);
+}
+
+.zoom-sync-status.is-ok {
+  color: var(--text-success);
+}
+
+.zoom-deploy-modal {
+  max-width: 560px;
+}
+
+.zoom-deploy-modal h2 {
+  margin-top: 0;
+}
+
+.zoom-deploy-step {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 0.75em 1em;
+  margin-bottom: 0.75em;
+}
+
+.zoom-deploy-step h3 {
+  margin: 0 0 0.35em;
+  font-size: var(--font-ui-medium);
+}
+
+.zoom-deploy-step .zoom-deploy-detail {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  white-space: pre-wrap;
+  font-family: var(--font-monospace);
+  max-height: 8em;
+  overflow: auto;
+}
+
+.zoom-deploy-step.is-ok {
+  border-color: var(--color-green);
+}
+
+.zoom-deploy-step.is-fail {
+  border-color: var(--color-red);
+}
+
+.zoom-deploy-step.is-running {
+  border-color: var(--color-orange);
+}
+
+.zoom-deploy-actions {
+  display: flex;
+  gap: 0.5em;
+  flex-wrap: wrap;
+  margin-top: 1em;
+}
+
+.zoom-log-tail {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  white-space: pre-wrap;
+  max-height: 16em;
+  overflow: auto;
+  background: var(--background-secondary);
+  border-radius: 6px;
+  padding: 0.75em;
+  margin-top: 0.5em;
+}
