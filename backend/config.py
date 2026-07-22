@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 from typing import List
 from urllib.parse import urlparse
@@ -49,9 +50,16 @@ LOCK_FILE = BASE_DIR / "sync.lock"
 # Chromium (which may be blocked by security policy). Valid channels:
 # "msedge", "chrome", "chrome-beta", "msedge-beta", etc. Set to "" (empty)
 # to fall back to Playwright's bundled Chromium (requires `playwright install`).
-# Default: Edge on Windows, bundled Chromium elsewhere (set by the Obsidian plugin).
-_DEFAULT_CHANNEL = "msedge" if os.name == "nt" else ""
-BROWSER_CHANNEL = os.environ.get("ZOOM_BROWSER_CHANNEL", _DEFAULT_CHANNEL)
+# Prefer real desktop browsers: Edge (Windows), Chrome (macOS), Chromium (Linux).
+if os.name == "nt":
+    _DEFAULT_CHANNEL = "msedge"
+elif sys.platform == "darwin":
+    _DEFAULT_CHANNEL = "chrome"
+else:
+    _DEFAULT_CHANNEL = ""
+# Empty env var must fall through to default (os.environ.get("", default) returns "").
+_raw_channel = os.environ.get("ZOOM_BROWSER_CHANNEL")
+BROWSER_CHANNEL = _DEFAULT_CHANNEL if _raw_channel is None or _raw_channel.strip() == "" else _raw_channel.strip()
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -82,6 +90,21 @@ def launch_kwargs(headless: bool) -> dict:
     kwargs: dict = {"headless": headless}
     if BROWSER_CHANNEL:
         kwargs["channel"] = BROWSER_CHANNEL
+    args = [
+        "--disable-dev-shm-usage",
+        "--no-default-browser-check",
+        "--disable-blink-features=AutomationControlled",
+    ]
+    # macOS: avoid background throttling that stalls Zoom’s SPA in automation.
+    if sys.platform == "darwin":
+        args.extend(
+            [
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+            ]
+        )
+    kwargs["args"] = args
     return kwargs
 
 
@@ -92,7 +115,14 @@ def new_context(browser, use_saved_state: bool = True):
     problems that plague persistent contexts on Windows. The authenticated
     session is carried via STORAGE_STATE instead.
     """
-    kwargs: dict = {"accept_downloads": True}
+    downloads = TRANSCRIPTS_DIR / ".playwright-downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+    kwargs: dict = {
+        "accept_downloads": True,
+        "downloads_path": str(downloads),
+        "viewport": {"width": 1400, "height": 900},
+        "locale": "en-US",
+    }
     if use_saved_state and STORAGE_STATE.exists():
         kwargs["storage_state"] = str(STORAGE_STATE)
     ctx = browser.new_context(**kwargs)
@@ -134,12 +164,18 @@ def validate_notes_url(url: str = None) -> str:
 def browser_process_names() -> List[str]:
     """Process image names used by the configured channel (for scoped cleanup)."""
     channel = (BROWSER_CHANNEL or "").lower()
-    if channel.startswith("msedge"):
-        return ["msedge.exe"]
+    if os.name == "nt":
+        if channel.startswith("msedge"):
+            return ["msedge.exe"]
+        if channel.startswith("chrome"):
+            return ["chrome.exe"]
+        return ["chrome.exe", "chromium.exe"]
+    # macOS / Linux process names (for pgrep/pkill token cleanup)
+    if channel.startswith("msedge") or channel.startswith("edge"):
+        return ["Microsoft Edge", "msedge"]
     if channel.startswith("chrome"):
-        return ["chrome.exe"]
-    # Bundled Chromium on Windows.
-    return ["chrome.exe", "chromium.exe"]
+        return ["Google Chrome", "chrome"]
+    return ["Chromium", "chrome", "chromium"]
 
 
 # --- Behaviour ------------------------------------------------------------

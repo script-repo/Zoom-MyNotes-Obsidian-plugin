@@ -53,22 +53,32 @@ def kill_by_command_token(
     if not names:
         return
 
-    # Build a PowerShell filter that matches any of the process names and the token.
-    name_clauses = " -or ".join(f"$_.Name -eq '{n}'" for n in names)
-    # Escape single quotes in token for PowerShell single-quoted string.
-    safe_token = token.replace("'", "''")
-    ps = (
-        f"Get-CimInstance Win32_Process | Where-Object {{ "
-        f"({name_clauses}) -and ($_.CommandLine -like '*{safe_token}*') "
-        f"}} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force "
-        f"-ErrorAction SilentlyContinue }}"
-    )
+    if os.name == "nt":
+        name_clauses = " -or ".join(f"$_.Name -eq '{n}'" for n in names)
+        safe_token = token.replace("'", "''")
+        ps = (
+            f"Get-CimInstance Win32_Process | Where-Object {{ "
+            f"({name_clauses}) -and ($_.CommandLine -like '*{safe_token}*') "
+            f"}} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force "
+            f"-ErrorAction SilentlyContinue }}"
+        )
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True,
+                timeout=timeout,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+        except Exception:
+            pass
+        return
+
+    # macOS / Linux: pkill by token in the full command line (scoped).
     try:
         subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps],
+            ["pkill", "-f", token],
             capture_output=True,
             timeout=timeout,
-            creationflags=_CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except Exception:
         pass
@@ -167,7 +177,16 @@ class BrowserSession:
         args = list(kwargs.get("args") or [])
         args.append(f"--zoom-sync-run-token={self.run_token}")
         kwargs["args"] = args
-        self.browser = self.playwright.chromium.launch(**kwargs)
+        try:
+            self.browser = self.playwright.chromium.launch(**kwargs)
+        except Exception:
+            # macOS without Chrome installed: fall back to bundled Chromium.
+            if kwargs.get("channel"):
+                fallback = dict(kwargs)
+                fallback.pop("channel", None)
+                self.browser = self.playwright.chromium.launch(**fallback)
+            else:
+                raise
         self.context = self._new_context_fn(self.browser, use_saved_state=self.use_saved_state)
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         return self

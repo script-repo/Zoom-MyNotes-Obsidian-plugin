@@ -11,8 +11,11 @@ export function hostPlatform(): HostPlatform {
 
 /** Playwright channel preferred for this OS. Empty = bundled Chromium. */
 export function defaultBrowserChannel(): string {
-  // Windows: prefer installed Edge. macOS/Linux: bundled Chromium via playwright install.
-  return hostPlatform() === "win32" ? "msedge" : "";
+  // Match real desktop browsers where possible — Zoom’s UI is flaky in plain headless Chromium.
+  // Windows: Edge. macOS: Chrome (installed). Linux: bundled Chromium.
+  if (hostPlatform() === "win32") return "msedge";
+  if (hostPlatform() === "darwin") return "chrome";
+  return "";
 }
 
 export function platformLabel(): string {

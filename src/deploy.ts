@@ -224,36 +224,71 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
       return steps;
     }
 
-    const installArgs =
+    // Install the channel browser bits. chrome/msedge use installed apps when present;
+    // always ensure chromium as a fallback for macOS/Linux.
+    const installTargets =
       channel === "msedge"
-        ? ["-m", "playwright", "install", "msedge"]
-        : ["-m", "playwright", "install", "chromium"];
-    const ir = await runProcess({
+        ? ["msedge"]
+        : channel === "chrome"
+          ? ["chrome", "chromium"]
+          : ["chromium"];
+    let lastCode = 0;
+    for (const target of installTargets) {
+      const ir = await runProcess({
+        kind: "custom",
+        settings: ctx.settings,
+        vaultPath: ctx.vaultPath,
+        command: py,
+        args: ["-m", "playwright", "install", target],
+        cwd: root,
+        timeoutMs: 15 * 60 * 1000,
+        onLine: log,
+      });
+      lastCode = ir.code ?? 1;
+      if (ir.code === 0) break;
+    }
+    // Smoke-test launch with the configured channel; fall back to bundled Chromium.
+    const smoke = await runProcess({
       kind: "custom",
       settings: ctx.settings,
       vaultPath: ctx.vaultPath,
       command: py,
-      args: installArgs,
+      args: [
+        "-c",
+        "from playwright.sync_api import sync_playwright\n"
+        + "import os\n"
+        + "ch=(os.environ.get('ZOOM_BROWSER_CHANNEL') or '').strip()\n"
+        + "p=sync_playwright().start()\n"
+        + "try:\n"
+        + "  kw={'headless':True}\n"
+        + "  if ch: kw['channel']=ch\n"
+        + "  b=p.chromium.launch(**kw); b.close(); print('launch ok', ch or 'chromium')\n"
+        + "except Exception as e:\n"
+        + "  if ch:\n"
+        + "    b=p.chromium.launch(headless=True); b.close(); print('fallback chromium ok', type(e).__name__)\n"
+        + "  else:\n"
+        + "    raise\n"
+        + "finally:\n"
+        + "  p.stop()\n",
+      ],
       cwd: root,
-      timeoutMs: 15 * 60 * 1000,
+      timeoutMs: 120_000,
       onLine: log,
     });
-    if (ir.code !== 0) {
+    if (smoke.code !== 0) {
       set(
         "playwright",
-        "ok",
-        `playwright import ok; browser install exited ${ir.code}. ` +
-          (hostPlatform() === "win32"
-            ? "Edge recommended on Windows."
-            : "Chromium will be used on macOS/Linux.")
+        "fail",
+        `Browser launch failed (channel=${channel || "chromium"}). ` +
+          `On macOS install Google Chrome, or re-run deploy. ${summarizeResult(smoke)}`
       );
-    } else {
-      set(
-        "playwright",
-        "ok",
-        `playwright ok; channel=${channel || "chromium"} (${platformLabel()})`
-      );
+      return steps;
     }
+    set(
+      "playwright",
+      "ok",
+      `${(smoke.stdout || "").trim() || "ok"}; install_exit=${lastCode} (${platformLabel()})`
+    );
   } catch (e) {
     set("playwright", "fail", e instanceof Error ? e.message : String(e));
     return steps;

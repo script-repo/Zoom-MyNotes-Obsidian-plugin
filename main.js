@@ -48,7 +48,9 @@ function hostPlatform() {
   return "other";
 }
 function defaultBrowserChannel() {
-  return hostPlatform() === "win32" ? "msedge" : "";
+  if (hostPlatform() === "win32") return "msedge";
+  if (hostPlatform() === "darwin") return "chrome";
+  return "";
 }
 function platformLabel() {
   switch (hostPlatform()) {
@@ -853,6 +855,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 from typing import List
 from urllib.parse import urlparse
@@ -893,9 +896,16 @@ LOCK_FILE = BASE_DIR / "sync.lock"
 # Chromium (which may be blocked by security policy). Valid channels:
 # "msedge", "chrome", "chrome-beta", "msedge-beta", etc. Set to "" (empty)
 # to fall back to Playwright's bundled Chromium (requires \`playwright install\`).
-# Default: Edge on Windows, bundled Chromium elsewhere (set by the Obsidian plugin).
-_DEFAULT_CHANNEL = "msedge" if os.name == "nt" else ""
-BROWSER_CHANNEL = os.environ.get("ZOOM_BROWSER_CHANNEL", _DEFAULT_CHANNEL)
+# Prefer real desktop browsers: Edge (Windows), Chrome (macOS), Chromium (Linux).
+if os.name == "nt":
+    _DEFAULT_CHANNEL = "msedge"
+elif sys.platform == "darwin":
+    _DEFAULT_CHANNEL = "chrome"
+else:
+    _DEFAULT_CHANNEL = ""
+# Empty env var must fall through to default (os.environ.get("", default) returns "").
+_raw_channel = os.environ.get("ZOOM_BROWSER_CHANNEL")
+BROWSER_CHANNEL = _DEFAULT_CHANNEL if _raw_channel is None or _raw_channel.strip() == "" else _raw_channel.strip()
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -926,6 +936,21 @@ def launch_kwargs(headless: bool) -> dict:
     kwargs: dict = {"headless": headless}
     if BROWSER_CHANNEL:
         kwargs["channel"] = BROWSER_CHANNEL
+    args = [
+        "--disable-dev-shm-usage",
+        "--no-default-browser-check",
+        "--disable-blink-features=AutomationControlled",
+    ]
+    # macOS: avoid background throttling that stalls Zoom\u2019s SPA in automation.
+    if sys.platform == "darwin":
+        args.extend(
+            [
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+            ]
+        )
+    kwargs["args"] = args
     return kwargs
 
 
@@ -936,7 +961,14 @@ def new_context(browser, use_saved_state: bool = True):
     problems that plague persistent contexts on Windows. The authenticated
     session is carried via STORAGE_STATE instead.
     """
-    kwargs: dict = {"accept_downloads": True}
+    downloads = TRANSCRIPTS_DIR / ".playwright-downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+    kwargs: dict = {
+        "accept_downloads": True,
+        "downloads_path": str(downloads),
+        "viewport": {"width": 1400, "height": 900},
+        "locale": "en-US",
+    }
     if use_saved_state and STORAGE_STATE.exists():
         kwargs["storage_state"] = str(STORAGE_STATE)
     ctx = browser.new_context(**kwargs)
@@ -978,12 +1010,18 @@ def validate_notes_url(url: str = None) -> str:
 def browser_process_names() -> List[str]:
     """Process image names used by the configured channel (for scoped cleanup)."""
     channel = (BROWSER_CHANNEL or "").lower()
-    if channel.startswith("msedge"):
-        return ["msedge.exe"]
+    if os.name == "nt":
+        if channel.startswith("msedge"):
+            return ["msedge.exe"]
+        if channel.startswith("chrome"):
+            return ["chrome.exe"]
+        return ["chrome.exe", "chromium.exe"]
+    # macOS / Linux process names (for pgrep/pkill token cleanup)
+    if channel.startswith("msedge") or channel.startswith("edge"):
+        return ["Microsoft Edge", "msedge"]
     if channel.startswith("chrome"):
-        return ["chrome.exe"]
-    # Bundled Chromium on Windows.
-    return ["chrome.exe", "chromium.exe"]
+        return ["Google Chrome", "chrome"]
+    return ["Chromium", "chrome", "chromium"]
 
 
 # --- Behaviour ------------------------------------------------------------
@@ -2463,22 +2501,32 @@ def kill_by_command_token(
     if not names:
         return
 
-    # Build a PowerShell filter that matches any of the process names and the token.
-    name_clauses = " -or ".join(f"$_.Name -eq '{n}'" for n in names)
-    # Escape single quotes in token for PowerShell single-quoted string.
-    safe_token = token.replace("'", "''")
-    ps = (
-        f"Get-CimInstance Win32_Process | Where-Object {{ "
-        f"({name_clauses}) -and ($_.CommandLine -like '*{safe_token}*') "
-        f"}} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force "
-        f"-ErrorAction SilentlyContinue }}"
-    )
+    if os.name == "nt":
+        name_clauses = " -or ".join(f"$_.Name -eq '{n}'" for n in names)
+        safe_token = token.replace("'", "''")
+        ps = (
+            f"Get-CimInstance Win32_Process | Where-Object {{ "
+            f"({name_clauses}) -and ($_.CommandLine -like '*{safe_token}*') "
+            f"}} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force "
+            f"-ErrorAction SilentlyContinue }}"
+        )
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True,
+                timeout=timeout,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+        except Exception:
+            pass
+        return
+
+    # macOS / Linux: pkill by token in the full command line (scoped).
     try:
         subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps],
+            ["pkill", "-f", token],
             capture_output=True,
             timeout=timeout,
-            creationflags=_CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except Exception:
         pass
@@ -2577,7 +2625,16 @@ class BrowserSession:
         args = list(kwargs.get("args") or [])
         args.append(f"--zoom-sync-run-token={self.run_token}")
         kwargs["args"] = args
-        self.browser = self.playwright.chromium.launch(**kwargs)
+        try:
+            self.browser = self.playwright.chromium.launch(**kwargs)
+        except Exception:
+            # macOS without Chrome installed: fall back to bundled Chromium.
+            if kwargs.get("channel"):
+                fallback = dict(kwargs)
+                fallback.pop("channel", None)
+                self.browser = self.playwright.chromium.launch(**fallback)
+            else:
+                raise
         self.context = self._new_context_fn(self.browser, use_saved_state=self.use_saved_state)
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         return self
@@ -2713,6 +2770,9 @@ function baseChildEnv() {
     "TEMP",
     "TMP",
     "TMPDIR",
+    // Real user home is required on macOS for Chrome/Chromium (fonts, keychain).
+    "HOME",
+    "USERPROFILE",
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
@@ -2742,22 +2802,24 @@ function baseChildEnv() {
 function buildEnv(settings, vaultPath, extra) {
   const transcripts = resolveTranscriptsDir(settings, vaultPath);
   const root = resolveSyncRoot(settings);
-  const sandbox = root ? path3.join(root, ".runtime-home") : "";
+  const channel = defaultBrowserChannel();
   const env = {
     ...baseChildEnv(),
     ZOOM_TRANSCRIPTS_DIR: transcripts,
     ZOOM_HEADLESS: settings.headless ? "1" : "0",
     ZOOM_LOG_TITLES: settings.logTitles ? "1" : "0",
-    ZOOM_BROWSER_CHANNEL: defaultBrowserChannel(),
     PYTHONUNBUFFERED: "1"
   };
-  if (sandbox) {
-    env.HOME = sandbox;
-    env.USERPROFILE = sandbox;
-    env.XDG_CACHE_HOME = path3.join(sandbox, "cache");
-    env.XDG_CONFIG_HOME = path3.join(sandbox, "config");
-    env.XDG_DATA_HOME = path3.join(sandbox, "data");
+  if (channel) env.ZOOM_BROWSER_CHANNEL = channel;
+  if (root) {
     env.PLAYWRIGHT_BROWSERS_PATH = path3.join(root, ".playwright");
+    if (hostPlatform() === "win32") {
+      const sandbox = path3.join(root, ".runtime-home");
+      env.USERPROFILE = sandbox;
+      env.HOME = sandbox;
+      env.APPDATA = path3.join(sandbox, "AppData", "Roaming");
+      env.LOCALAPPDATA = path3.join(sandbox, "AppData", "Local");
+    }
   }
   return { ...env, ...extra };
 }
@@ -3525,30 +3587,48 @@ ${root}`
       set("playwright", "fail", summarizeResult(r));
       return steps;
     }
-    const installArgs = channel === "msedge" ? ["-m", "playwright", "install", "msedge"] : ["-m", "playwright", "install", "chromium"];
-    const ir = await runProcess({
+    const installTargets = channel === "msedge" ? ["msedge"] : channel === "chrome" ? ["chrome", "chromium"] : ["chromium"];
+    let lastCode = 0;
+    for (const target of installTargets) {
+      const ir = await runProcess({
+        kind: "custom",
+        settings: ctx.settings,
+        vaultPath: ctx.vaultPath,
+        command: py,
+        args: ["-m", "playwright", "install", target],
+        cwd: root,
+        timeoutMs: 15 * 60 * 1e3,
+        onLine: log
+      });
+      lastCode = ir.code ?? 1;
+      if (ir.code === 0) break;
+    }
+    const smoke = await runProcess({
       kind: "custom",
       settings: ctx.settings,
       vaultPath: ctx.vaultPath,
       command: py,
-      args: installArgs,
+      args: [
+        "-c",
+        "from playwright.sync_api import sync_playwright\nimport os\nch=(os.environ.get('ZOOM_BROWSER_CHANNEL') or '').strip()\np=sync_playwright().start()\ntry:\n  kw={'headless':True}\n  if ch: kw['channel']=ch\n  b=p.chromium.launch(**kw); b.close(); print('launch ok', ch or 'chromium')\nexcept Exception as e:\n  if ch:\n    b=p.chromium.launch(headless=True); b.close(); print('fallback chromium ok', type(e).__name__)\n  else:\n    raise\nfinally:\n  p.stop()\n"
+      ],
       cwd: root,
-      timeoutMs: 15 * 60 * 1e3,
+      timeoutMs: 12e4,
       onLine: log
     });
-    if (ir.code !== 0) {
+    if (smoke.code !== 0) {
       set(
         "playwright",
-        "ok",
-        `playwright import ok; browser install exited ${ir.code}. ` + (hostPlatform() === "win32" ? "Edge recommended on Windows." : "Chromium will be used on macOS/Linux.")
+        "fail",
+        `Browser launch failed (channel=${channel || "chromium"}). On macOS install Google Chrome, or re-run deploy. ${summarizeResult(smoke)}`
       );
-    } else {
-      set(
-        "playwright",
-        "ok",
-        `playwright ok; channel=${channel || "chromium"} (${platformLabel()})`
-      );
+      return steps;
     }
+    set(
+      "playwright",
+      "ok",
+      `${(smoke.stdout || "").trim() || "ok"}; install_exit=${lastCode} (${platformLabel()})`
+    );
   } catch (e) {
     set("playwright", "fail", e instanceof Error ? e.message : String(e));
     return steps;

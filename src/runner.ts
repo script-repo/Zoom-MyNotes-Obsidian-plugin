@@ -90,6 +90,9 @@ function baseChildEnv(): NodeJS.ProcessEnv {
     "TEMP",
     "TMP",
     "TMPDIR",
+    // Real user home is required on macOS for Chrome/Chromium (fonts, keychain).
+    "HOME",
+    "USERPROFILE",
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
@@ -124,23 +127,29 @@ function buildEnv(
 ): NodeJS.ProcessEnv {
   const transcripts = resolveTranscriptsDir(settings, vaultPath);
   const root = resolveSyncRoot(settings);
-  // Sandbox "home" under the sync repo so Playwright/Python never need the real user profile.
-  const sandbox = root ? path.join(root, ".runtime-home") : "";
+  const channel = defaultBrowserChannel();
   const env: NodeJS.ProcessEnv = {
     ...baseChildEnv(),
     ZOOM_TRANSCRIPTS_DIR: transcripts,
     ZOOM_HEADLESS: settings.headless ? "1" : "0",
     ZOOM_LOG_TITLES: settings.logTitles ? "1" : "0",
-    ZOOM_BROWSER_CHANNEL: defaultBrowserChannel(),
     PYTHONUNBUFFERED: "1",
   };
-  if (sandbox) {
-    env.HOME = sandbox;
-    env.USERPROFILE = sandbox;
-    env.XDG_CACHE_HOME = path.join(sandbox, "cache");
-    env.XDG_CONFIG_HOME = path.join(sandbox, "config");
-    env.XDG_DATA_HOME = path.join(sandbox, "data");
+  // Only set channel when non-empty so Python can apply its own defaults.
+  if (channel) env.ZOOM_BROWSER_CHANNEL = channel;
+
+  // Keep Playwright browser binaries under the backend root (portable).
+  // Do NOT override HOME on macOS/Linux — Chromium/Chrome need a normal home
+  // for fonts, keychain, and GPU; a fake HOME breaks Zoom’s web UI there.
+  if (root) {
     env.PLAYWRIGHT_BROWSERS_PATH = path.join(root, ".playwright");
+    if (hostPlatform() === "win32") {
+      const sandbox = path.join(root, ".runtime-home");
+      env.USERPROFILE = sandbox;
+      env.HOME = sandbox;
+      env.APPDATA = path.join(sandbox, "AppData", "Roaming");
+      env.LOCALAPPDATA = path.join(sandbox, "AppData", "Local");
+    }
   }
   return { ...env, ...extra };
 }
