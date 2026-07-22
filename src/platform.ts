@@ -1,4 +1,3 @@
-import * as os from "os";
 import * as path from "path";
 
 export type HostPlatform = "win32" | "darwin" | "linux" | "other";
@@ -10,13 +9,16 @@ export function hostPlatform(): HostPlatform {
   return "other";
 }
 
+/**
+ * User home directory for scheduler install paths only (LaunchAgents / ~ expansion).
+ * Prefer HOME/USERPROFILE over os.userInfo to avoid extra identity APIs.
+ */
 export function homeDir(): string {
-  return os.homedir() || process.env.HOME || process.env.USERPROFILE || "";
+  return process.env.HOME || process.env.USERPROFILE || "";
 }
 
 /** Playwright channel preferred for this OS. */
 export function defaultBrowserChannel(): string {
-  // Edge is commonly preinstalled on Windows; Chromium is the portable default elsewhere.
   return hostPlatform() === "win32" ? "msedge" : "chromium";
 }
 
@@ -49,7 +51,7 @@ export function schedulerLabel(): string {
 
 /** POSIX single-quote (bash / sh). */
 export function shellQuotePosix(value: string): string {
-  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
 /** PowerShell single-quoted string. */

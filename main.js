@@ -33,7 +33,6 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
-var fs5 = __toESM(require("fs"));
 var path6 = __toESM(require("path"));
 
 // src/deploy.ts
@@ -41,7 +40,6 @@ var fs4 = __toESM(require("fs"));
 var path5 = __toESM(require("path"));
 
 // src/platform.ts
-var os = __toESM(require("os"));
 var path = __toESM(require("path"));
 function hostPlatform() {
   if (process.platform === "win32") return "win32";
@@ -50,7 +48,7 @@ function hostPlatform() {
   return "other";
 }
 function homeDir() {
-  return os.homedir() || process.env.HOME || process.env.USERPROFILE || "";
+  return process.env.HOME || process.env.USERPROFILE || "";
 }
 function defaultBrowserChannel() {
   return hostPlatform() === "win32" ? "msedge" : "chromium";
@@ -203,7 +201,7 @@ function cancelActive() {
       });
     } else if (pid) {
       child.kill("SIGTERM");
-      setTimeout(() => {
+      window.setTimeout(() => {
         try {
           if (!child.killed) child.kill("SIGKILL");
         } catch {
@@ -215,10 +213,56 @@ function cancelActive() {
   active = null;
   return true;
 }
+function baseChildEnv() {
+  const keys = [
+    "PATH",
+    "Path",
+    "PATHEXT",
+    "SystemRoot",
+    "SYSTEMROOT",
+    "windir",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD",
+    "ZOOM_BROWSER_CHANNEL",
+    "ComSpec",
+    "COMSPEC",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "DYLD_LIBRARY_PATH",
+    "LD_LIBRARY_PATH"
+  ];
+  const env = {};
+  for (const k of keys) {
+    const v = process.env[k];
+    if (v !== void 0) env[k] = v;
+  }
+  return env;
+}
 function buildEnv(settings, vaultPath, extra) {
   const transcripts = resolveTranscriptsDir(settings, vaultPath);
   return {
-    ...process.env,
+    ...baseChildEnv(),
     ZOOM_TRANSCRIPTS_DIR: transcripts,
     ZOOM_HEADLESS: settings.headless ? "1" : "0",
     ZOOM_LOG_TITLES: settings.logTitles ? "1" : "0",
@@ -226,6 +270,9 @@ function buildEnv(settings, vaultPath, extra) {
     PYTHONUNBUFFERED: "1",
     ...extra
   };
+}
+function toError(err) {
+  return err instanceof Error ? err : new Error(String(err));
 }
 async function runProcess(opts) {
   if (active) {
@@ -242,6 +289,7 @@ async function runProcess(opts) {
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let timer = null;
     let child;
     try {
       child = (0, import_child_process.spawn)(command, args, {
@@ -251,14 +299,14 @@ async function runProcess(opts) {
         shell: false
       });
     } catch (e) {
-      reject(e);
+      reject(toError(e));
       return;
     }
     active = child;
     const finish = (code, signal) => {
       if (settled) return;
       settled = true;
-      if (timer) clearTimeout(timer);
+      if (timer !== null) window.clearTimeout(timer);
       if (active === child) active = null;
       resolve2({
         kind: opts.kind,
@@ -270,15 +318,14 @@ async function runProcess(opts) {
         command: cmdLabel
       });
     };
-    let timer = null;
     if (opts.timeoutMs && opts.timeoutMs > 0) {
-      timer = setTimeout(() => {
+      timer = window.setTimeout(() => {
         cancelActive();
         finish(null, "SIGTERM");
       }, opts.timeoutMs);
     }
     const feed = (chunk, stream) => {
-      const text = chunk.toString();
+      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       if (stream === "stdout") stdout += text;
       else stderr += text;
       if (opts.onLine) {
@@ -289,14 +336,16 @@ async function runProcess(opts) {
       if (stdout.length > 2e5) stdout = stdout.slice(-15e4);
       if (stderr.length > 2e5) stderr = stderr.slice(-15e4);
     };
-    child.stdout.on("data", (d) => feed(d, "stdout"));
-    child.stderr.on("data", (d) => feed(d, "stderr"));
+    const onStdout = (chunk) => feed(chunk, "stdout");
+    const onStderr = (chunk) => feed(chunk, "stderr");
+    child.stdout.on("data", onStdout);
+    child.stderr.on("data", onStderr);
     child.on("error", (err) => {
       if (settled) return;
       settled = true;
-      if (timer) clearTimeout(timer);
+      if (timer !== null) window.clearTimeout(timer);
       if (active === child) active = null;
-      reject(err);
+      reject(toError(err));
     });
     child.on("close", (code, signal) => finish(code, signal));
   });
@@ -878,11 +927,12 @@ ${summarizeResult(result)}`);
   } catch (e) {
     set("task", "fail", e instanceof Error ? e.message : String(e));
   }
-  set("plugin", "running", "Copying plugin into .obsidian/plugins\u2026");
+  const configDir = ctx.configDir || ".obsidian";
+  set("plugin", "running", `Copying plugin into ${configDir}/plugins\u2026`);
   try {
     const dest = path5.join(
       ctx.vaultPath,
-      ".obsidian",
+      configDir,
       "plugins",
       "zoom-mynotes-sync"
     );
@@ -900,7 +950,7 @@ ${summarizeResult(result)}`);
     }
     const community = path5.join(
       ctx.vaultPath,
-      ".obsidian",
+      configDir,
       "community-plugins.json"
     );
     let list = [];
@@ -1013,7 +1063,7 @@ var ZoomMyNotesSyncPlugin = class extends import_obsidian.Plugin {
     this.addCommand({
       id: "zoom-sync-open-folder",
       name: "Open transcripts folder",
-      callback: () => this.openTranscriptsFolder()
+      callback: () => void this.openTranscriptsFolder()
     });
     this.addCommand({
       id: "zoom-sync-show-log",
@@ -1031,7 +1081,8 @@ var ZoomMyNotesSyncPlugin = class extends import_obsidian.Plugin {
     cancelActive();
   }
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const data = await this.loadData();
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data ?? {});
   }
   async saveSettings() {
     await this.saveData(this.settings);
@@ -1044,6 +1095,9 @@ var ZoomMyNotesSyncPlugin = class extends import_obsidian.Plugin {
       return adapter.getBasePath();
     }
     throw new Error("Vault base path unavailable (desktop only)");
+  }
+  configDir() {
+    return this.app.vault.configDir;
   }
   pluginSourceDir() {
     const dir = this.manifest.dir;
@@ -1116,11 +1170,7 @@ var ZoomMyNotesSyncPlugin = class extends import_obsidian.Plugin {
     this.setRunning(true, "syncing\u2026");
     if (!quiet) new import_obsidian.Notice("Zoom sync started");
     try {
-      const result = await runSync(
-        this.settings,
-        this.vaultPath(),
-        (line) => console.log("[zoom-sync]", line)
-      );
+      const result = await runSync(this.settings, this.vaultPath());
       await this.recordResult(result);
       const msg = `Zoom sync ${exitLabel(result.code)} (${Math.round(result.durationMs / 1e3)}s)`;
       new import_obsidian.Notice(msg);
@@ -1149,11 +1199,7 @@ var ZoomMyNotesSyncPlugin = class extends import_obsidian.Plugin {
     new import_obsidian.Notice("Zoom login: complete SSO in the browser window");
     try {
       const settings = { ...this.settings, headless: false };
-      const result = await runLogin(
-        settings,
-        this.vaultPath(),
-        (line) => console.log("[zoom-login]", line)
-      );
+      const result = await runLogin(settings, this.vaultPath());
       await this.recordResult(result);
       new import_obsidian.Notice(
         result.code === 0 ? "Zoom login saved" : `Zoom login ${exitLabel(result.code)}`
@@ -1175,16 +1221,14 @@ var ZoomMyNotesSyncPlugin = class extends import_obsidian.Plugin {
     }
     await this.saveSettings();
   }
-  openTranscriptsFolder() {
+  async openTranscriptsFolder() {
     try {
-      const dir = resolveTranscriptsDir(this.settings, this.vaultPath());
-      fs5.mkdirSync(dir, { recursive: true });
       const rel = (0, import_obsidian.normalizePath)(this.settings.outputFolder || "mynotes");
-      const folder = this.app.vault.getAbstractFileByPath(rel);
-      if (folder) {
-        this.app.workspace.getLeavesOfType("file-explorer")[0]?.view?.revealInFolder?.(folder);
+      if (!this.app.vault.getAbstractFileByPath(rel)) {
+        await this.app.vault.createFolder(rel);
       }
-      new import_obsidian.Notice(`Transcripts: ${dir}`);
+      const abs = resolveTranscriptsDir(this.settings, this.vaultPath());
+      new import_obsidian.Notice(`Transcripts folder: ${rel} (${abs})`);
     } catch (e) {
       new import_obsidian.Notice(e instanceof Error ? e.message : String(e));
     }
@@ -1195,62 +1239,218 @@ var ZoomSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     super(app, plugin);
     this.plugin = plugin;
   }
+  getSettingDefinitions() {
+    const pathPlaceholder = process.platform === "win32" ? "C:\\Users\\\u2026\\zoom-mynotes-sync" : "/Users/\u2026/zoom-mynotes-sync";
+    return [
+      {
+        type: "group",
+        heading: "Zoom MyNotes Sync",
+        items: [
+          {
+            name: "About",
+            desc: "Controls the Python + Playwright backend that downloads Zoom AI notes transcripts into this vault. Desktop only; runs a local Python process you configure."
+          },
+          {
+            name: "Sync repo path",
+            desc: "Absolute path to the zoom-mynotes-sync repository (contains sync.py).",
+            aliases: ["sync root", "python repo"],
+            control: {
+              type: "text",
+              key: "syncRoot",
+              placeholder: pathPlaceholder
+            }
+          },
+          {
+            name: "Python path",
+            desc: "Optional. Leave empty to use .venv (Windows: Scripts/python.exe, macOS/Linux: bin/python3).",
+            control: {
+              type: "text",
+              key: "pythonPath",
+              placeholder: "(auto)"
+            }
+          },
+          {
+            name: "Transcripts folder",
+            desc: "Vault-relative folder for .md transcripts (month subfolders inside).",
+            control: {
+              type: "folder",
+              key: "outputFolder",
+              placeholder: "mynotes",
+              includeRoot: false
+            }
+          },
+          {
+            name: "Headless sync",
+            desc: "Run browser without a visible window (login always opens a window).",
+            control: {
+              type: "toggle",
+              key: "headless"
+            }
+          },
+          {
+            name: "Log meeting titles",
+            desc: "Include titles in sync logs (off by default for privacy).",
+            control: {
+              type: "toggle",
+              key: "logTitles"
+            }
+          },
+          {
+            name: "Auto-sync while Obsidian is open",
+            desc: "Minutes between syncs (0 = disabled). OS background job still covers when Obsidian is closed.",
+            aliases: ["interval"],
+            control: {
+              type: "number",
+              key: "autoSyncMinutes",
+              placeholder: "0",
+              min: 0,
+              step: 1
+            }
+          },
+          {
+            name: "Background job name",
+            desc: "Name used by the deploy wizard: Windows Task Scheduler, macOS LaunchAgent, or Linux cron marker.",
+            control: {
+              type: "text",
+              key: "taskName",
+              placeholder: "ZoomNotesSync"
+            }
+          },
+          {
+            name: "Open deploy wizard",
+            desc: "Create venv, install deps, register OS background job, install plugin into vault.",
+            action: () => {
+              new DeployModal(this.app, this.plugin).open();
+            }
+          },
+          {
+            name: "Sync now",
+            desc: "Run the Python sync backend once.",
+            action: () => {
+              void this.plugin.commandSync();
+            }
+          },
+          {
+            name: "Login",
+            desc: "Interactive Zoom SSO (opens a browser window).",
+            action: () => {
+              void this.plugin.commandLogin();
+            }
+          },
+          {
+            name: "Show log",
+            desc: "Open the latest sync log from the backend repo.",
+            action: () => {
+              new LogModal(this.app, this.plugin).open();
+            }
+          },
+          {
+            name: "Resolved paths",
+            desc: "Current paths used by the plugin.",
+            searchable: true,
+            render: (setting) => {
+              const root = resolveSyncRoot(this.plugin.settings);
+              const lines = [
+                `repo: ${root || "(not set)"}`,
+                `python: ${resolvePython(this.plugin.settings)}`,
+                `transcripts: ${resolveTranscriptsDir(this.plugin.settings, this.plugin.vaultPath())}`,
+                `configDir: ${this.plugin.configDir()}`,
+                `last: ${this.plugin.settings.lastSyncAt || "never"} (${this.plugin.settings.lastStatus || "\u2014"})`
+              ];
+              setting.setDesc(lines.join("\n"));
+              setting.descEl.addClass("zoom-deploy-detail");
+            }
+          }
+        ]
+      }
+    ];
+  }
+  async setControlValue(key, value) {
+    const k = key;
+    switch (k) {
+      case "syncRoot":
+      case "pythonPath":
+        this.plugin.settings[k] = String(value ?? "").trim();
+        break;
+      case "outputFolder": {
+        const folder = String(value ?? "").trim() || "mynotes";
+        this.plugin.settings.outputFolder = (0, import_obsidian.normalizePath)(folder);
+        break;
+      }
+      case "taskName":
+        this.plugin.settings.taskName = String(value ?? "").trim() || "ZoomNotesSync";
+        break;
+      case "headless":
+      case "logTitles":
+        this.plugin.settings[k] = Boolean(value);
+        break;
+      case "autoSyncMinutes": {
+        const n = typeof value === "number" ? value : parseInt(String(value), 10);
+        this.plugin.settings.autoSyncMinutes = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+        break;
+      }
+      default:
+        break;
+    }
+    await this.plugin.saveSettings();
+  }
+  /**
+   * Fallback for Obsidian &lt; 1.13 when getSettingDefinitions is unavailable.
+   */
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Zoom MyNotes Sync" });
+    new import_obsidian.Setting(containerEl).setName("Zoom MyNotes Sync").setHeading();
     containerEl.createEl("p", {
       text: "Controls the Python + Playwright backend that downloads Zoom AI notes transcripts into this vault."
     });
-    new import_obsidian.Setting(containerEl).setName("Sync repo path").setDesc("Absolute path to the zoom-mynotes-sync repository (contains sync.py).").addText(
+    new import_obsidian.Setting(containerEl).setName("Sync repo path").setDesc(
+      "Absolute path to the zoom-mynotes-sync repository (contains sync.py)."
+    ).addText(
       (t) => t.setPlaceholder(
         process.platform === "win32" ? "C:\\Users\\\u2026\\zoom-mynotes-sync" : "/Users/\u2026/zoom-mynotes-sync"
       ).setValue(this.plugin.settings.syncRoot).onChange(async (v) => {
-        this.plugin.settings.syncRoot = v.trim();
-        await this.plugin.saveSettings();
+        await this.setControlValue("syncRoot", v);
       })
     );
     new import_obsidian.Setting(containerEl).setName("Python path").setDesc(
       "Optional. Leave empty to use .venv (Windows: Scripts/python.exe, macOS/Linux: bin/python3)."
     ).addText(
       (t) => t.setPlaceholder("(auto)").setValue(this.plugin.settings.pythonPath).onChange(async (v) => {
-        this.plugin.settings.pythonPath = v.trim();
-        await this.plugin.saveSettings();
+        await this.setControlValue("pythonPath", v);
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Transcripts folder").setDesc("Vault-relative folder for .md transcripts (month subfolders inside).").addText(
+    new import_obsidian.Setting(containerEl).setName("Transcripts folder").setDesc(
+      "Vault-relative folder for .md transcripts (month subfolders inside)."
+    ).addText(
       (t) => t.setPlaceholder("mynotes").setValue(this.plugin.settings.outputFolder).onChange(async (v) => {
-        this.plugin.settings.outputFolder = v.trim() || "mynotes";
-        await this.plugin.saveSettings();
+        await this.setControlValue("outputFolder", v);
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Headless sync").setDesc("Run browser without a visible window (login always opens a window).").addToggle(
+    new import_obsidian.Setting(containerEl).setName("Headless sync").setDesc(
+      "Run browser without a visible window (login always opens a window)."
+    ).addToggle(
       (t) => t.setValue(this.plugin.settings.headless).onChange(async (v) => {
-        this.plugin.settings.headless = v;
-        await this.plugin.saveSettings();
+        await this.setControlValue("headless", v);
       })
     );
     new import_obsidian.Setting(containerEl).setName("Log meeting titles").setDesc("Include titles in sync logs (off by default for privacy).").addToggle(
       (t) => t.setValue(this.plugin.settings.logTitles).onChange(async (v) => {
-        this.plugin.settings.logTitles = v;
-        await this.plugin.saveSettings();
+        await this.setControlValue("logTitles", v);
       })
     );
     new import_obsidian.Setting(containerEl).setName("Auto-sync while Obsidian is open").setDesc(
-      "Minutes between syncs (0 = disabled). OS background job (Task Scheduler / launchd / cron) still covers when Obsidian is closed."
+      "Minutes between syncs (0 = disabled). OS background job still covers when Obsidian is closed."
     ).addText(
       (t) => t.setPlaceholder("0").setValue(String(this.plugin.settings.autoSyncMinutes || 0)).onChange(async (v) => {
-        const n = parseInt(v.trim(), 10);
-        this.plugin.settings.autoSyncMinutes = Number.isFinite(n) && n > 0 ? n : 0;
-        await this.plugin.saveSettings();
+        await this.setControlValue("autoSyncMinutes", v);
       })
     );
     new import_obsidian.Setting(containerEl).setName("Background job name").setDesc(
       "Name used by the deploy wizard: Windows Task Scheduler, macOS LaunchAgent, or Linux cron marker."
     ).addText(
       (t) => t.setPlaceholder("ZoomNotesSync").setValue(this.plugin.settings.taskName).onChange(async (v) => {
-        this.plugin.settings.taskName = v.trim() || "ZoomNotesSync";
-        await this.plugin.saveSettings();
+        await this.setControlValue("taskName", v);
       })
     );
     new import_obsidian.Setting(containerEl).setName("Deploy wizard").setDesc(
@@ -1269,14 +1469,15 @@ var ZoomSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     );
     const root = resolveSyncRoot(this.plugin.settings);
     const info = containerEl.createDiv({ cls: "zoom-deploy-step" });
-    info.createEl("h3", { text: "Resolved paths" });
+    new import_obsidian.Setting(info).setName("Resolved paths").setHeading();
     const lines = [
       `repo: ${root || "(not set)"}`,
       `python: ${resolvePython(this.plugin.settings)}`,
       `transcripts: ${resolveTranscriptsDir(this.plugin.settings, this.plugin.vaultPath())}`,
+      `configDir: ${this.plugin.configDir()}`,
       `last: ${this.plugin.settings.lastSyncAt || "never"} (${this.plugin.settings.lastStatus || "\u2014"})`
     ];
-    info.createEl("div", { cls: "zoom-deploy-detail", text: lines.join("\n") });
+    info.createDiv({ cls: "zoom-deploy-detail", text: lines.join("\n") });
   }
 };
 var DeployModal = class extends import_obsidian.Modal {
@@ -1291,19 +1492,17 @@ var DeployModal = class extends import_obsidian.Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("zoom-deploy-modal");
-    contentEl.createEl("h2", { text: "Zoom MyNotes deploy wizard" });
+    new import_obsidian.Setting(contentEl).setName("Zoom MyNotes deploy wizard").setHeading();
     contentEl.createEl("p", {
       text: "Sets up the Python backend, vault output folder, OS background job (Task Scheduler / launchd / cron), and this plugin. Works on Windows, macOS, and Linux."
     });
     this.stepsEl = contentEl.createDiv();
     this.renderSteps([]);
-    this.logEl = contentEl.createEl("div", { cls: "zoom-log-tail" });
+    this.logEl = contentEl.createDiv({ cls: "zoom-log-tail" });
     this.logEl.setText("Ready.");
-    const actions = contentEl.createDiv({ cls: "zoom-deploy-actions" });
-    const runBtn = actions.createEl("button", { text: "Run full deploy", cls: "mod-cta" });
-    runBtn.onclick = () => void this.run();
-    const closeBtn = actions.createEl("button", { text: "Close" });
-    closeBtn.onclick = () => this.close();
+    new import_obsidian.Setting(contentEl).addButton(
+      (b) => b.setButtonText("Run full deploy").setCta().onClick(() => void this.run())
+    ).addButton((b) => b.setButtonText("Close").onClick(() => this.close()));
   }
   onClose() {
     this.contentEl.empty();
@@ -1318,11 +1517,14 @@ var DeployModal = class extends import_obsidian.Modal {
       return;
     }
     for (const s of steps) {
+      const statusClass = s.status === "ok" ? "is-ok" : s.status === "fail" ? "is-fail" : s.status === "running" ? "is-running" : "";
       const el = this.stepsEl.createDiv({
-        cls: `zoom-deploy-step is-${s.status === "ok" ? "ok" : s.status === "fail" ? "fail" : s.status === "running" ? "running" : ""}`
+        cls: `zoom-deploy-step ${statusClass}`.trim()
       });
-      el.createEl("h3", { text: `${statusGlyph(s.status)} ${s.title}` });
-      if (s.detail) el.createEl("div", { cls: "zoom-deploy-detail", text: s.detail });
+      new import_obsidian.Setting(el).setName(`${statusGlyph(s.status)} ${s.title}`).setHeading();
+      if (s.detail) {
+        el.createDiv({ cls: "zoom-deploy-detail", text: s.detail });
+      }
     }
   }
   appendLog(line) {
@@ -1342,6 +1544,7 @@ var DeployModal = class extends import_obsidian.Modal {
       const steps = await runFullDeploy({
         settings: this.plugin.settings,
         vaultPath: this.plugin.vaultPath(),
+        configDir: this.plugin.configDir(),
         pluginDir: this.plugin.pluginSourceDir(),
         onUpdate: (s) => this.renderSteps(s),
         onLog: (line) => this.appendLog(line)
@@ -1367,7 +1570,7 @@ var LogModal = class extends import_obsidian.Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: "Latest sync log" });
+    new import_obsidian.Setting(contentEl).setName("Latest sync log").setHeading();
     const root = resolveSyncRoot(this.plugin.settings);
     const logPath = latestLogPath(root);
     if (!logPath) {
@@ -1375,7 +1578,7 @@ var LogModal = class extends import_obsidian.Modal {
       return;
     }
     contentEl.createEl("p", { text: logPath });
-    contentEl.createEl("div", {
+    contentEl.createDiv({
       cls: "zoom-log-tail",
       text: readTail(logPath)
     });

@@ -48,6 +48,8 @@ export interface DeployStep {
 export interface DeployContext {
   settings: ZoomSyncSettings;
   vaultPath: string;
+  /** Obsidian config folder name from Vault#configDir (not always `.obsidian`). */
+  configDir: string;
   pluginDir: string;
   onUpdate: (steps: DeployStep[]) => void;
   onLog?: (line: string) => void;
@@ -323,11 +325,12 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
   }
 
   // 9. Install plugin files into vault
-  set("plugin", "running", "Copying plugin into .obsidian/plugins…");
+  const configDir = ctx.configDir || ".obsidian";
+  set("plugin", "running", `Copying plugin into ${configDir}/plugins…`);
   try {
     const dest = path.join(
       ctx.vaultPath,
-      ".obsidian",
+      configDir,
       "plugins",
       "zoom-mynotes-sync"
     );
@@ -345,7 +348,7 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
     }
     const community = path.join(
       ctx.vaultPath,
-      ".obsidian",
+      configDir,
       "community-plugins.json"
     );
     let list: string[] = [];

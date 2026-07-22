@@ -60,7 +60,7 @@ export function cancelActive(): boolean {
       });
     } else if (pid) {
       child.kill("SIGTERM");
-      setTimeout(() => {
+      window.setTimeout(() => {
         try {
           if (!child.killed) child.kill("SIGKILL");
         } catch {
@@ -75,6 +75,57 @@ export function cancelActive(): boolean {
   return true;
 }
 
+/**
+ * Pass only env vars needed for Python/Playwright child processes.
+ * Avoids forwarding the entire process environment (fingerprint risk).
+ */
+function baseChildEnv(): NodeJS.ProcessEnv {
+  const keys = [
+    "PATH",
+    "Path",
+    "PATHEXT",
+    "SystemRoot",
+    "SYSTEMROOT",
+    "windir",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD",
+    "ZOOM_BROWSER_CHANNEL",
+    "ComSpec",
+    "COMSPEC",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "DYLD_LIBRARY_PATH",
+    "LD_LIBRARY_PATH",
+  ];
+  const env: NodeJS.ProcessEnv = {};
+  for (const k of keys) {
+    const v = process.env[k];
+    if (v !== undefined) env[k] = v;
+  }
+  return env;
+}
+
 function buildEnv(
   settings: ZoomSyncSettings,
   vaultPath: string,
@@ -82,7 +133,7 @@ function buildEnv(
 ): NodeJS.ProcessEnv {
   const transcripts = resolveTranscriptsDir(settings, vaultPath);
   return {
-    ...process.env,
+    ...baseChildEnv(),
     ZOOM_TRANSCRIPTS_DIR: transcripts,
     ZOOM_HEADLESS: settings.headless ? "1" : "0",
     ZOOM_LOG_TITLES: settings.logTitles ? "1" : "0",
@@ -91,6 +142,10 @@ function buildEnv(
     PYTHONUNBUFFERED: "1",
     ...extra,
   };
+}
+
+function toError(err: unknown): Error {
+  return err instanceof Error ? err : new Error(String(err));
 }
 
 export async function runProcess(opts: RunOptions): Promise<RunResult> {
@@ -110,6 +165,7 @@ export async function runProcess(opts: RunOptions): Promise<RunResult> {
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let timer: number | null = null;
 
     let child: ChildProcessWithoutNullStreams;
     try {
@@ -120,7 +176,7 @@ export async function runProcess(opts: RunOptions): Promise<RunResult> {
         shell: false,
       });
     } catch (e) {
-      reject(e);
+      reject(toError(e));
       return;
     }
 
@@ -129,7 +185,7 @@ export async function runProcess(opts: RunOptions): Promise<RunResult> {
     const finish = (code: number | null, signal: NodeJS.Signals | null) => {
       if (settled) return;
       settled = true;
-      if (timer) clearTimeout(timer);
+      if (timer !== null) window.clearTimeout(timer);
       if (active === child) active = null;
       resolve({
         kind: opts.kind,
@@ -142,16 +198,15 @@ export async function runProcess(opts: RunOptions): Promise<RunResult> {
       });
     };
 
-    let timer: ReturnType<typeof setTimeout> | null = null;
     if (opts.timeoutMs && opts.timeoutMs > 0) {
-      timer = setTimeout(() => {
+      timer = window.setTimeout(() => {
         cancelActive();
         finish(null, "SIGTERM");
       }, opts.timeoutMs);
     }
 
     const feed = (chunk: Buffer | string, stream: "stdout" | "stderr") => {
-      const text = chunk.toString();
+      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       if (stream === "stdout") stdout += text;
       else stderr += text;
       if (opts.onLine) {
@@ -163,14 +218,17 @@ export async function runProcess(opts: RunOptions): Promise<RunResult> {
       if (stderr.length > 200_000) stderr = stderr.slice(-150_000);
     };
 
-    child.stdout.on("data", (d) => feed(d, "stdout"));
-    child.stderr.on("data", (d) => feed(d, "stderr"));
-    child.on("error", (err) => {
+    const onStdout = (chunk: Buffer | string) => feed(chunk, "stdout");
+    const onStderr = (chunk: Buffer | string) => feed(chunk, "stderr");
+
+    child.stdout.on("data", onStdout);
+    child.stderr.on("data", onStderr);
+    child.on("error", (err: Error) => {
       if (settled) return;
       settled = true;
-      if (timer) clearTimeout(timer);
+      if (timer !== null) window.clearTimeout(timer);
       if (active === child) active = null;
-      reject(err);
+      reject(toError(err));
     });
     child.on("close", (code, signal) => finish(code, signal));
   });
