@@ -1,6 +1,9 @@
 # Dependencies
 node_modules/
 
+# Generated at build time (committed so tsc works; rebuild overwrites)
+# src/backendBundle.generated.ts
+
 # Build / tooling
 *.tsbuildinfo
 .DS_Store

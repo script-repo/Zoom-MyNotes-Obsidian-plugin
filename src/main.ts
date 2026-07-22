@@ -24,6 +24,7 @@ import {
   resolveSyncRoot,
   resolveTranscriptsDir,
 } from "./paths";
+// looksLikeSyncRoot still used by assertReady
 import {
   cancelActive,
   exitLabel,
@@ -308,9 +309,9 @@ class ZoomSyncSettingTab extends PluginSettingTab {
             desc: "Controls the Python + Playwright backend that downloads Zoom AI notes transcripts into this vault. Desktop only; runs a local Python process you configure.",
           },
           {
-            name: "Sync repo path",
-            desc: "Absolute path to the zoom-mynotes-sync repository (contains sync.py). Do not use ~.",
-            aliases: ["sync root", "python repo"],
+            name: "Sync backend path",
+            desc: "Filled automatically by Deploy wizard (under your vault config folder). Override only if you maintain your own backend.",
+            aliases: ["sync root", "python repo", "sync repo path"],
             control: {
               type: "text",
               key: "syncRoot",
@@ -319,7 +320,7 @@ class ZoomSyncSettingTab extends PluginSettingTab {
           },
           {
             name: "Python path",
-            desc: "Optional absolute path. Leave empty to use .venv (Windows: Scripts/python.exe, macOS/Linux: bin/python3).",
+            desc: "Filled automatically by Deploy wizard (.venv or portable Python). Leave empty for auto.",
             control: {
               type: "text",
               key: "pythonPath",
@@ -611,13 +612,11 @@ class DeployModal extends Modal {
   plugin: ZoomMyNotesSyncPlugin;
   stepsEl: HTMLElement | null = null;
   logEl: HTMLElement | null = null;
-  pathInput = "";
   busy = false;
 
   constructor(app: App, plugin: ZoomMyNotesSyncPlugin) {
     super(app);
     this.plugin = plugin;
-    this.pathInput = plugin.settings.syncRoot || "";
   }
 
   onOpen(): void {
@@ -628,39 +627,14 @@ class DeployModal extends Modal {
     new Setting(contentEl).setName("Deploy wizard").setHeading();
 
     contentEl.createEl("p", {
-      text: "This plugin controls a separate Python project (the folder that contains sync.py). Enter that folder’s absolute path below, then run deploy.",
+      text: "One click installs everything automatically: Python backend, Python runtime (if needed), packages, Playwright browser, transcripts folder, and a background sync job. No manual downloads required.",
     });
-
-    const pathPlaceholder =
-      process.platform === "win32"
-        ? "C:\\Users\\you\\zoom-mynotes-sync"
-        : process.platform === "darwin"
-          ? "/Users/you/zoom-mynotes-sync"
-          : "/home/you/zoom-mynotes-sync";
-
-    new Setting(contentEl)
-      .setName("Sync repo path")
-      .setDesc(
-        "Absolute path to the folder with sync.py, config.py, and requirements.txt. Required before deploy."
-      )
-      .addText((t) => {
-        t.setPlaceholder(pathPlaceholder)
-          .setValue(this.pathInput)
-          .onChange((v) => {
-            this.pathInput = v.trim();
-          });
-        t.inputEl.style.width = "100%";
-      });
 
     this.stepsEl = contentEl.createDiv();
     this.renderSteps([]);
 
     this.logEl = contentEl.createDiv({ cls: "zoom-log-tail" });
-    this.logEl.setText(
-      this.pathInput
-        ? "Ready. Click Run full deploy."
-        : "Enter the sync repo path above, then click Run full deploy."
-    );
+    this.logEl.setText("Ready. Click Run full deploy.");
 
     new Setting(contentEl)
       .addButton((b) =>
@@ -681,7 +655,7 @@ class DeployModal extends Modal {
     this.stepsEl.empty();
     if (!steps.length) {
       this.stepsEl.createEl("p", {
-        text: "After the path is set, click Run full deploy. Safe to re-run; completed steps are skipped when already done.",
+        text: "Click Run full deploy to start. Safe to re-run anytime.",
       });
       return;
     }
@@ -709,9 +683,8 @@ class DeployModal extends Modal {
   private appendLog(line: string): void {
     if (!this.logEl) return;
     const prev = this.logEl.getText();
-    const next = (prev.startsWith("Ready") || prev.startsWith("Enter ")
-      ? ""
-      : prev + "\n") + line;
+    const next =
+      (prev.startsWith("Ready") ? "" : prev + "\n") + line;
     this.logEl.setText(next.slice(-4000));
     this.logEl.scrollTop = this.logEl.scrollHeight;
   }
@@ -721,27 +694,6 @@ class DeployModal extends Modal {
       new Notice("A job is already running");
       return;
     }
-
-    const pathVal = this.pathInput.trim();
-    if (!pathVal) {
-      new Notice("Enter the sync repo path first (folder containing sync.py)");
-      this.appendLog(
-        "Missing sync repo path. Example (macOS): /Users/you/zoom-mynotes-sync"
-      );
-      return;
-    }
-    if (!looksLikeSyncRoot(pathVal)) {
-      new Notice(
-        "Path must be a folder that contains sync.py, config.py, and requirements.txt"
-      );
-      this.appendLog(
-        `Not a valid sync repo: ${pathVal}\nExpected files: sync.py, config.py, requirements.txt`
-      );
-      return;
-    }
-
-    this.plugin.settings.syncRoot = pathVal;
-    await this.plugin.saveSettings();
 
     this.busy = true;
     try {

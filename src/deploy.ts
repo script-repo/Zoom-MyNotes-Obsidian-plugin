@@ -13,9 +13,12 @@ import {
   looksLikeSyncRoot,
   pathExists,
   resolvePython,
-  resolveSyncRoot,
   resolveTranscriptsDir,
 } from "./paths";
+import {
+  ensureBundledBackend,
+  ensurePython,
+} from "./provision";
 import { runRegisterSchedule, writeLocalEnvFiles } from "./schedule";
 import type { ZoomSyncSettings } from "./settings";
 import {
@@ -66,64 +69,16 @@ function step(
 
 export function initialSteps(): DeployStep[] {
   return [
-    step("root", "Locate sync repo"),
-    step("python", "Find system Python"),
+    step("root", "Install Python backend"),
+    step("python", "Locate or download Python"),
     step("venv", "Create .venv"),
     step("deps", "Install Python packages"),
-    step("playwright", `Verify Playwright + browser (${platformLabel()})`),
+    step("playwright", `Install Playwright browser (${platformLabel()})`),
     step("output", "Prepare transcripts folder"),
     step("auth", "Check Zoom login state"),
     step("task", `Register ${schedulerLabel()} job`),
     step("plugin", "Install plugin into this vault"),
   ];
-}
-
-function emptySettings(): ZoomSyncSettings {
-  return {
-    syncRoot: "",
-    pythonPath: "",
-    outputFolder: "mynotes",
-    autoSyncMinutes: 0,
-    headless: true,
-    logTitles: false,
-    taskName: "ZoomNotesSync",
-    lastSyncAt: "",
-    lastExitCode: null,
-    lastStatus: "",
-  };
-}
-
-async function whichPython(onLog?: (s: string) => void): Promise<string | null> {
-  const candidates =
-    hostPlatform() === "win32"
-      ? ["py", "python", "python3"]
-      : ["python3", "python"];
-  for (const cmd of candidates) {
-    try {
-      const result = await runProcess({
-        kind: "custom",
-        settings: emptySettings(),
-        vaultPath: process.cwd(),
-        command: cmd,
-        args: ["-c", "import sys; print(sys.executable)"],
-        cwd: process.cwd(),
-        timeoutMs: 15_000,
-        onLine: onLog ? (l) => onLog(l) : undefined,
-      });
-      const line = (result.stdout || "")
-        .trim()
-        .split(/\r?\n/)
-        .filter(Boolean)
-        .pop();
-      if (result.code === 0 && line && (isFile(line) || pathExists(line))) {
-        return line;
-      }
-      if (result.code === 0 && line) return line;
-    } catch {
-      /* try next */
-    }
-  }
-  return null;
 }
 
 function summarizeResult(r: RunResult): string {
@@ -151,39 +106,61 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
   };
   const log = (line: string) => ctx.onLog?.(line);
 
-  // 1. Root
-  set("root", "running", "Checking…");
-  const root = resolveSyncRoot(ctx.settings);
-  if (!looksLikeSyncRoot(root)) {
-    const hint =
-      process.platform === "darwin"
-        ? "/Users/you/zoom-mynotes-sync"
-        : process.platform === "win32"
-          ? "C:\\Users\\you\\zoom-mynotes-sync"
-          : "/home/you/zoom-mynotes-sync";
+  const configDir = (ctx.configDir || "").trim();
+  if (!configDir) {
     set(
       "root",
       "fail",
-      root
-        ? `Not a valid sync repo (need sync.py, config.py, requirements.txt):\n${root}`
-        : `Sync repo path is empty. In this wizard (or Settings), set it to the folder that contains sync.py.\nExample: ${hint}`
+      "Missing vault config directory (Vault.configDir is empty)."
     );
     return steps;
   }
-  set("root", "ok", root);
 
-  // 2. System python
-  set("python", "running", "Searching…");
-  const systemPy = await whichPython(log);
-  if (!systemPy) {
+  // 1. Provision bundled backend (no manual clone / path required)
+  set("root", "running", "Writing bundled backend…");
+  let root = "";
+  try {
+    const provisioned = ensureBundledBackend(
+      ctx.vaultPath,
+      configDir,
+      ctx.settings
+    );
+    root = provisioned.root;
+    if (!looksLikeSyncRoot(root)) {
+      set(
+        "root",
+        "fail",
+        `Backend incomplete at ${root} (need sync.py, config.py, requirements.txt)`
+      );
+      return steps;
+    }
+    set(
+      "root",
+      "ok",
+      provisioned.reused
+        ? `Using existing backend:\n${root}`
+        : `Installed backend (${provisioned.wrote.length} files):\n${root}`
+    );
+  } catch (e) {
+    set("root", "fail", e instanceof Error ? e.message : String(e));
+    return steps;
+  }
+
+  // 2. System Python or portable download
+  set("python", "running", "Searching for Python (download if missing)…");
+  let bootstrapPy = "";
+  try {
+    const found = await ensurePython(root, ctx.settings, ctx.vaultPath, log);
+    bootstrapPy = found.python;
     set(
       "python",
-      "fail",
-      "No python3/python on PATH. Install Python 3.11+ and retry."
+      "ok",
+      `${found.source}: ${bootstrapPy}`
     );
+  } catch (e) {
+    set("python", "fail", e instanceof Error ? e.message : String(e));
     return steps;
   }
-  set("python", "ok", systemPy);
 
   // 3. Venv
   set("venv", "running", "Creating .venv if needed…");
@@ -192,7 +169,12 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
     set("venv", "ok", `Exists: ${venvPy}`);
   } else {
     try {
-      const r = await runSetupVenv(ctx.settings, ctx.vaultPath, systemPy, log);
+      const r = await runSetupVenv(
+        ctx.settings,
+        ctx.vaultPath,
+        bootstrapPy,
+        log
+      );
       venvPy = resolveVenvPython(root);
       if (r.code !== 0 || !venvPy) {
         set("venv", "fail", summarizeResult(r));
@@ -206,6 +188,7 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
   }
 
   ctx.settings.pythonPath = venvPy;
+  ctx.settings.syncRoot = root;
 
   // 4. pip install
   set("deps", "running", "pip install -r requirements.txt…");
@@ -223,7 +206,7 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
 
   // 5. Playwright + browser bits
   const channel = defaultBrowserChannel();
-  set("playwright", "running", `import playwright + ensure ${channel}…`);
+  set("playwright", "running", `import playwright + ensure ${channel || "chromium"}…`);
   try {
     const py = resolvePython(ctx.settings);
     const r = await runProcess({
@@ -231,10 +214,7 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
       settings: ctx.settings,
       vaultPath: ctx.vaultPath,
       command: py,
-      args: [
-        "-c",
-        "import playwright; print('playwright ok')",
-      ],
+      args: ["-c", "import playwright; print('playwright ok')"],
       cwd: root,
       timeoutMs: 30_000,
       onLine: log,
@@ -244,7 +224,6 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
       return steps;
     }
 
-    // Install browser binaries for the preferred channel (no-op if already present).
     const installArgs =
       channel === "msedge"
         ? ["-m", "playwright", "install", "msedge"]
@@ -256,16 +235,14 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
       command: py,
       args: installArgs,
       cwd: root,
-      timeoutMs: 10 * 60 * 1000,
+      timeoutMs: 15 * 60 * 1000,
       onLine: log,
     });
     if (ir.code !== 0) {
-      // Soft-fail: user may already have a system browser Playwright can attach to.
       set(
         "playwright",
         "ok",
         `playwright import ok; browser install exited ${ir.code}. ` +
-          `Set ZOOM_BROWSER_CHANNEL if needed (default ${channel}). ` +
           (hostPlatform() === "win32"
             ? "Edge recommended on Windows."
             : "Chromium will be used on macOS/Linux.")
@@ -274,7 +251,7 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
       set(
         "playwright",
         "ok",
-        `playwright ok; channel=${channel} (${platformLabel()})`
+        `playwright ok; channel=${channel || "chromium"} (${platformLabel()})`
       );
     }
   } catch (e) {
@@ -309,11 +286,11 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
     set(
       "auth",
       "skip",
-      "No storage_state.json yet — run command “Login (interactive SSO)” once after deploy."
+      "No login yet — run command “Login (interactive SSO)” once after deploy."
     );
   }
 
-  // 8. Background schedule (Windows / macOS / Linux)
+  // 8. Background schedule
   set("task", "running", `Registering ${schedulerLabel()}…`);
   try {
     const { result, detail } = await runRegisterSchedule({
@@ -332,16 +309,7 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
     set("task", "fail", e instanceof Error ? e.message : String(e));
   }
 
-  // 9. Install plugin files into vault (config dir from Vault#configDir only)
-  const configDir = (ctx.configDir || "").trim();
-  if (!configDir) {
-    set(
-      "plugin",
-      "fail",
-      "Missing vault config directory (Vault.configDir is empty)."
-    );
-    return steps;
-  }
+  // 9. Ensure plugin files present in vault
   set("plugin", "running", `Copying plugin into ${configDir}/plugins…`);
   try {
     const dest = path.join(
@@ -357,6 +325,11 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
     for (const f of files) {
       const from = path.join(srcDir, f);
       if (!pathExists(from)) {
+        // Already running from vault install — treat as ok
+        if (pathExists(path.join(dest, f))) {
+          copied.push(`${f} (present)`);
+          continue;
+        }
         throw new Error(`Missing build artifact: ${from}`);
       }
       fs.copyFileSync(from, path.join(dest, f));
@@ -383,7 +356,7 @@ export async function runFullDeploy(ctx: DeployContext): Promise<DeployStep[]> {
     set(
       "plugin",
       "ok",
-      `Installed to ${dest} (${copied.join(", ")}). Reload Obsidian if this is first install.`
+      `Plugin ready at ${dest} (${copied.join(", ")}).`
     );
   } catch (e) {
     set("plugin", "fail", e instanceof Error ? e.message : String(e));
@@ -408,7 +381,8 @@ export function deploySummary(steps: DeployStep[]): string {
   const fail = steps.filter((s) => s.status === "fail");
   const ok = steps.filter((s) => s.status === "ok");
   const skip = steps.filter((s) => s.status === "skip");
-  if (fail.length) return `Deploy incomplete: ${fail.map((f) => f.id).join(", ")} failed`;
+  if (fail.length)
+    return `Deploy incomplete: ${fail.map((f) => f.id).join(", ")} failed`;
   return `Deploy OK (${ok.length} ok, ${skip.length} skipped)`;
 }
 

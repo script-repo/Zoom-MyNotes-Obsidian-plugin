@@ -9,9 +9,10 @@ export function hostPlatform(): HostPlatform {
   return "other";
 }
 
-/** Playwright channel preferred for this OS. */
+/** Playwright channel preferred for this OS. Empty = bundled Chromium. */
 export function defaultBrowserChannel(): string {
-  return hostPlatform() === "win32" ? "msedge" : "chromium";
+  // Windows: prefer installed Edge. macOS/Linux: bundled Chromium via playwright install.
+  return hostPlatform() === "win32" ? "msedge" : "";
 }
 
 export function platformLabel(): string {

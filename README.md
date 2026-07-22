@@ -21,16 +21,15 @@
 - Sets `ZOOM_TRANSCRIPTS_DIR` to `<vault>/<output folder>` on every run so notes land in your vault
 - Sets `ZOOM_BROWSER_CHANNEL` to `msedge` on Windows and `chromium` on macOS/Linux (overridable)
 
-The browser automation lives in a **separate local Python project** (folder containing `sync.py` / `login.py`). This plugin is the control plane and installer; it does not embed the scraper.
+The Python sync backend is **bundled inside the plugin**. Deploy wizard installs it automatically under your vault config folder — no separate clone or path setup.
 
 ## Requirements
 
 - [Obsidian](https://obsidian.md) **desktop** (Windows, macOS, or Linux)
-- **Python 3.11+** on `PATH` for first-time deploy (`python3` on macOS/Linux)
-- Browser for Playwright:
-  - **Windows:** Microsoft Edge (channel `msedge`), or Chromium via Playwright install
-  - **macOS / Linux:** Chromium (installed by the deploy wizard via `playwright install chromium`)
-- A local clone of the **Zoom MyNotes Python sync backend** (must contain `sync.py`, `config.py`, `requirements.txt`)
+- Network access on first deploy (downloads portable Python if needed, plus Playwright browser bits)
+- Browser:
+  - **Windows:** Microsoft Edge preferred
+  - **macOS / Linux:** Chromium (installed by deploy)
 
 ## Install in Obsidian
 
@@ -118,23 +117,20 @@ Then enable the plugin in Obsidian and reload.
 
 ## First-time setup
 
-1. Clone or locate your **Python Zoom MyNotes sync** project on disk (the folder that contains `sync.py`).
-2. In Obsidian, open **Settings → Zoom MyNotes Sync**.
-3. Set **Sync repo path** to that folder’s absolute path:
-   - Windows: `C:\Users\you\zoom-mynotes-sync`
-   - macOS / Linux: `/Users/you/zoom-mynotes-sync` or `/home/you/zoom-mynotes-sync`
-4. Run **Open deploy wizard** (also available from the command palette).
-5. Click **Run full deploy**. This will:
-   - locate Python and create `.venv` in the sync repo
-   - install Python packages and Playwright browser bits (Edge on Windows, Chromium on macOS/Linux)
-   - create the vault transcripts folder (default `mynotes`)
-   - write portable runners: `local-env.sh`, `local-env.ps1`, `run-sync.sh`, `run-sync.ps1`
-   - register a background job every 30 minutes (Task Scheduler / launchd / cron)
-   - confirm plugin files in the vault
-6. Run command **Login (interactive SSO)** and complete Zoom sign-in in the browser window.
-7. Run **Sync now** (ribbon icon or command palette).
+1. Enable the plugin, then run **Open deploy wizard** (command palette or settings).
+2. Click **Run full deploy**. This automatically:
+   - installs the bundled Python backend under `<vault>/<configDir>/zoom-mynotes-backend`
+   - uses system Python if present, otherwise downloads a portable CPython
+   - creates `.venv`, `pip install`s dependencies
+   - installs Playwright browser bits (Edge on Windows, Chromium on macOS/Linux)
+   - creates the vault transcripts folder (default `mynotes`)
+   - registers a background job every 30 minutes (Task Scheduler / launchd / cron)
+3. Run **Login (interactive SSO)** once and complete Zoom sign-in in the browser.
+4. Run **Sync now** (ribbon or command palette).
 
 Transcripts appear under the configured vault folder (default `mynotes/`), often with month subfolders.
+
+The only interactive step after deploy is **Zoom login** (SSO cannot be automated without your credentials).
 
 ## Commands
 
