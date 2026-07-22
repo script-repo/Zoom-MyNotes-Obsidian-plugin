@@ -33,15 +33,19 @@ export function ensureBundledBackend(
   configDir: string,
   settings: ZoomSyncSettings
 ): { root: string; wrote: string[]; reused: boolean } {
-  // Prefer an existing valid user-configured root.
-  if (settings.syncRoot && looksLikeSyncRoot(settings.syncRoot)) {
-    return { root: settings.syncRoot, wrote: [], reused: true };
-  }
-
-  const root = defaultBackendRoot(vaultPath, configDir);
-  const wrote = writeBundledBackend(root);
-  settings.syncRoot = root;
-  return { root, wrote, reused: false };
+  // Prefer an existing user-configured root if it already looks valid; still
+  // refresh bundled source files so plugin updates ship scraper fixes.
+  const preferred =
+    settings.syncRoot && looksLikeSyncRoot(settings.syncRoot)
+      ? settings.syncRoot
+      : defaultBackendRoot(vaultPath, configDir);
+  const wrote = writeBundledBackend(preferred);
+  settings.syncRoot = preferred;
+  return {
+    root: preferred,
+    wrote,
+    reused: looksLikeSyncRoot(preferred),
+  };
 }
 
 function emptySettings(): ZoomSyncSettings {

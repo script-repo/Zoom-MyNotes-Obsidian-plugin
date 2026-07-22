@@ -2853,13 +2853,14 @@ function writeBundledBackend(destRoot) {
   return written;
 }
 function ensureBundledBackend(vaultPath, configDir, settings) {
-  if (settings.syncRoot && looksLikeSyncRoot(settings.syncRoot)) {
-    return { root: settings.syncRoot, wrote: [], reused: true };
-  }
-  const root = defaultBackendRoot(vaultPath, configDir);
-  const wrote = writeBundledBackend(root);
-  settings.syncRoot = root;
-  return { root, wrote, reused: false };
+  const preferred = settings.syncRoot && looksLikeSyncRoot(settings.syncRoot) ? settings.syncRoot : defaultBackendRoot(vaultPath, configDir);
+  const wrote = writeBundledBackend(preferred);
+  settings.syncRoot = preferred;
+  return {
+    root: preferred,
+    wrote,
+    reused: looksLikeSyncRoot(preferred)
+  };
 }
 function emptySettings() {
   return {
