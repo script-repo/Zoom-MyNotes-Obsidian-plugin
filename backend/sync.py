@@ -388,7 +388,11 @@ def process_notes(page, index: IndexStore, lock: lockfile.LockHandle | None, sta
                 last_error=result.error,
             )
             stats.absent += 1
-            log.info("No transcript for %s; backoff scheduled.", label)
+            log.info(
+                "No transcript for %s; backoff scheduled. (%s)",
+                label,
+                (result.error or "")[:200],
+            )
         elif result.outcome == DownloadOutcome.SELECTOR_BROKEN:
             index.add(
                 note_id,
@@ -481,6 +485,13 @@ def run_browser_phase(lock: lockfile.LockHandle | None = None) -> int:
     missing = index.reconcile_files(config.BASE_DIR)
     if missing:
         log.warning("Reconcile: %d downloaded record(s) missing files; will retry.", len(missing))
+
+    requeued = index.requeue_false_absents()
+    if requeued:
+        log.info(
+            "Re-queued %d note(s) previously marked no-transcript (likely menu/UI miss).",
+            requeued,
+        )
 
     orphans = index.find_orphan_files(config.TRANSCRIPTS_DIR, config.BASE_DIR)
     stats.orphans = len(orphans)

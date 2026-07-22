@@ -128,6 +128,33 @@ class IndexStore:
             return None
         return self.transcripts.get(key)
 
+    def requeue_false_absents(self) -> int:
+        """Re-open notes wrongly marked absent due to UI/menu selector misses."""
+        markers = (
+            "download menu item missing",
+            "menu items:",
+            "kebab not found",
+        )
+        count = 0
+        for key, rec in list(self.transcripts.items()):
+            if rec.get("status") != STATUS_NO_TRANSCRIPT:
+                continue
+            err = str(rec.get("last_error") or "").lower()
+            if not any(m in err for m in markers):
+                # Also requeue absents with empty error (older runs).
+                if err.strip():
+                    continue
+            rec = dict(rec)
+            rec["status"] = STATUS_RETRYABLE
+            rec["next_retry"] = ""
+            rec["last_outcome"] = "requeued_false_absent"
+            rec["last_error"] = "requeued for selector refresh"
+            self.transcripts[key] = rec
+            count += 1
+        if count:
+            self.save()
+        return count
+
     def should_process(self, note_id: str, *, now: datetime = None) -> bool:
         """True if this note should be opened/checked on this run."""
         now = now or _now()

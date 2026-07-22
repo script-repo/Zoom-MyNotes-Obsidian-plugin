@@ -40,12 +40,32 @@ SELECTORS = {
     ],
     "kebab": [
         'button[aria-label="More"]',
+        'button[aria-label*="More" i]',
         'button[aria-label*="more" i]',
+        'button[aria-label*="options" i]',
+        'button[aria-label*="Page options" i]',
         'button[aria-haspopup="menu"]',
+        'button[data-testid*="more" i]',
+        'button[data-testid*="menu" i]',
     ],
     "download_transcript": [
         '[role="menuitem"]:has-text("Download transcript")',
+        '[role="menuitem"]:has-text("Download Transcript")',
+        '[role="menuitem"]:has-text("Export transcript")',
+        '[role="menuitem"]:has-text("Export Transcript")',
+        '[role="menuitem"]:has-text("Download as")',
+        '[role="menuitem"]:has-text("transcript")',
         'text="Download transcript"',
+        'text="Download Transcript"',
+        'text=/download\\s+transcript/i',
+        'text=/export\\s+transcript/i',
+        'button:has-text("Download transcript")',
+        'a:has-text("Download transcript")',
+    ],
+    "transcript_tab": [
+        '[role="tab"]:has-text("Transcript")',
+        'button:has-text("Transcript")',
+        'text=Transcript',
     ],
     "opened_title": [
         '[data-testid="note-title"]',
@@ -487,75 +507,288 @@ def _wait_opened(page: Page, note: NoteRef) -> None:
         page.wait_for_timeout(500)
 
 
-def download_transcript(page: Page, dest: Path) -> DownloadResult:
-    """Open the kebab menu and download transcript to dest (via .part file)."""
+def _menu_item_labels(page: Page) -> List[str]:
+    """Collect visible menu/list item labels for diagnostics."""
+    labels: List[str] = []
+    for sel in (
+        '[role="menuitem"]',
+        '[role="option"]',
+        '[role="menu"] button',
+        '[role="menu"] a',
+        'div[role="menu"] *',
+    ):
+        try:
+            loc = page.locator(sel)
+            count = min(loc.count(), 40)
+        except PWError:
+            continue
+        for i in range(count):
+            try:
+                item = loc.nth(i)
+                if not item.is_visible():
+                    continue
+                text = _clean(item.inner_text(timeout=800))
+            except PWError:
+                continue
+            if text and text not in labels and len(text) < 120:
+                labels.append(text)
+        if labels:
+            break
+    return labels
+
+
+def _find_download_menu_item(page: Page) -> Optional[Locator]:
+    """Find a download/export transcript control with loose matching."""
+    item = _first_usable(page, SELECTORS["download_transcript"])
+    if item is not None:
+        return item
+
+    # Scan all menuitems for transcript-related actions.
+    patterns = (
+        re.compile(r"download\s+transcript", re.I),
+        re.compile(r"export\s+transcript", re.I),
+        re.compile(r"download\s+.*transcript", re.I),
+        re.compile(r"transcript\s*\.(txt|vtt|docx|md)", re.I),
+        re.compile(r"^download$", re.I),
+        re.compile(r"^export$", re.I),
+    )
+    try:
+        loc = page.locator('[role="menuitem"], [role="option"], [role="menu"] button, [role="menu"] a')
+        count = min(loc.count(), 40)
+    except PWError:
+        return None
+    for i in range(count):
+        try:
+            candidate = loc.nth(i)
+            if not candidate.is_visible():
+                continue
+            text = _clean(candidate.inner_text(timeout=800))
+        except PWError:
+            continue
+        if not text:
+            continue
+        for pat in patterns:
+            if pat.search(text):
+                return candidate
+    return None
+
+
+def _all_kebabs(page: Page) -> List[Locator]:
+    """Return distinct visible kebab/more buttons (main content preferred)."""
+    found: List[Locator] = []
+    seen: Set[str] = set()
+    for sel in SELECTORS["kebab"]:
+        try:
+            loc = page.locator(sel)
+            count = min(loc.count(), 20)
+        except PWError:
+            continue
+        for i in range(count):
+            try:
+                item = loc.nth(i)
+                if not item.is_visible():
+                    continue
+                box = item.bounding_box()
+                key = (
+                    f"{int(box['x'])}:{int(box['y'])}"
+                    if box
+                    else f"{sel}:{i}"
+                )
+            except PWError:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(item)
+    # Prefer buttons further right / in the content header (typical note chrome).
+    def _sort_key(el: Locator) -> tuple:
+        try:
+            box = el.bounding_box() or {"x": 0, "y": 0}
+            return (-float(box.get("x", 0)), float(box.get("y", 0)))
+        except PWError:
+            return (0.0, 0.0)
+
+    found.sort(key=_sort_key)
+    return found
+
+
+def _write_text_download(dest: Path, text: str) -> DownloadResult:
     import hashlib
 
-    kebab = _first_usable(page, SELECTORS["kebab"])
-    if kebab is None:
+    body = (text or "").strip()
+    if len(body) < 40:
+        return DownloadResult(DownloadOutcome.ABSENT, error="extracted transcript too short")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_suffix(dest.suffix + ".part")
+    data = (body + "\n").encode("utf-8")
+    part.write_bytes(data)
+    digest = hashlib.sha256(data).hexdigest()
+    part.replace(dest)
+    return DownloadResult(
+        DownloadOutcome.DOWNLOADED,
+        path=dest,
+        size=len(data),
+        sha256=digest,
+    )
+
+
+def _extract_transcript_from_page(page: Page) -> str:
+    """Best-effort scrape of an on-page Transcript panel when menu download is missing."""
+    # Open Transcript tab if present.
+    tab = _first_usable(page, SELECTORS["transcript_tab"])
+    if tab is not None:
+        try:
+            tab.click(timeout=config.ACTION_TIMEOUT_MS)
+            page.wait_for_timeout(1000)
+        except PWError:
+            pass
+
+    # Prefer dedicated transcript containers.
+    container_sels = [
+        '[data-testid*="transcript" i]',
+        '[class*="transcript" i]',
+        '[aria-label*="transcript" i]',
+        'section:has-text("Transcript")',
+        'main',
+        '[role="main"]',
+    ]
+    best = ""
+    for sel in container_sels:
+        try:
+            loc = page.locator(sel)
+            count = min(loc.count(), 8)
+        except PWError:
+            continue
+        for i in range(count):
+            try:
+                item = loc.nth(i)
+                if not item.is_visible():
+                    continue
+                text = item.inner_text(timeout=3000)
+            except PWError:
+                continue
+            text = (text or "").strip()
+            # Heuristic: real transcripts are multi-line and longer than chrome.
+            if text.count("\n") >= 3 and len(text) > len(best):
+                # Drop obvious shell chrome lines.
+                lines = [
+                    ln
+                    for ln in text.splitlines()
+                    if _clean(ln).lower()
+                    not in OPENED_TITLE_DENYLIST | NAV_DENYLIST
+                ]
+                candidate = "\n".join(lines).strip()
+                if len(candidate) > len(best):
+                    best = candidate
+        if len(best) > 400:
+            break
+    return best
+
+
+def download_transcript(page: Page, dest: Path) -> DownloadResult:
+    """Download transcript via menu, else scrape on-page transcript text."""
+    import hashlib
+
+    kebabs = _all_kebabs(page)
+    if not kebabs:
+        # Last resort: page scrape without menu.
+        scraped = _extract_transcript_from_page(page)
+        if scraped:
+            return _write_text_download(dest, scraped)
         return DownloadResult(DownloadOutcome.SELECTOR_BROKEN, error="kebab not found")
 
-    try:
-        kebab.click(timeout=config.ACTION_TIMEOUT_MS)
-    except PWTimeoutError as exc:
+    menu_labels_seen: List[str] = []
+    last_error = "download menu item missing"
+
+    for kebab in kebabs[:6]:
         _dismiss_menu(page)
-        # Overlay intercept often surfaces as timeout.
-        return DownloadResult(DownloadOutcome.RETRYABLE, error=f"kebab click: {exc}")
-    except PWError as exc:
-        _dismiss_menu(page)
-        return DownloadResult(DownloadOutcome.RETRYABLE, error=f"kebab click: {exc}")
-
-    try:
-        page.wait_for_timeout(800)
-        item = _first_usable(page, SELECTORS["download_transcript"])
-        if item is None:
-            return DownloadResult(DownloadOutcome.ABSENT, error="download menu item missing")
-
-        part = dest.with_suffix(dest.suffix + ".part")
-        if part.exists():
-            try:
-                part.unlink()
-            except OSError:
-                pass
-
         try:
-            with page.expect_download(timeout=config.DOWNLOAD_TIMEOUT_MS) as dl_info:
-                item.click(timeout=config.ACTION_TIMEOUT_MS)
-            download = dl_info.value
+            kebab.click(timeout=config.ACTION_TIMEOUT_MS)
         except PWTimeoutError as exc:
-            return DownloadResult(DownloadOutcome.RETRYABLE, error=f"download timeout: {exc}")
+            last_error = f"kebab click: {exc}"
+            continue
         except PWError as exc:
-            return DownloadResult(DownloadOutcome.RETRYABLE, error=f"download error: {exc}")
+            last_error = f"kebab click: {exc}"
+            continue
 
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        download.save_as(str(part))
         try:
-            size = part.stat().st_size
-        except OSError as exc:
-            return DownloadResult(DownloadOutcome.RETRYABLE, error=f"stat failed: {exc}")
-        if size <= 0:
+            page.wait_for_timeout(900)
+            labels = _menu_item_labels(page)
+            for lab in labels:
+                if lab not in menu_labels_seen:
+                    menu_labels_seen.append(lab)
+
+            item = _find_download_menu_item(page)
+            if item is None:
+                last_error = "download menu item missing"
+                continue
+
+            part = dest.with_suffix(dest.suffix + ".part")
+            if part.exists():
+                try:
+                    part.unlink()
+                except OSError:
+                    pass
+
             try:
-                part.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return DownloadResult(DownloadOutcome.RETRYABLE, error="empty download")
+                with page.expect_download(timeout=config.DOWNLOAD_TIMEOUT_MS) as dl_info:
+                    item.click(timeout=config.ACTION_TIMEOUT_MS)
+                download = dl_info.value
+            except PWTimeoutError as exc:
+                # Some UIs copy/export without a browser download event — try scrape.
+                last_error = f"download timeout: {exc}"
+                scraped = _extract_transcript_from_page(page)
+                if scraped:
+                    return _write_text_download(dest, scraped)
+                continue
+            except PWError as exc:
+                last_error = f"download error: {exc}"
+                continue
 
-        # Basic text sanity: reject obvious binary empties.
-        try:
-            data = part.read_bytes()
-            if b"\x00" in data[:2048]:
-                part.unlink(missing_ok=True)
-                return DownloadResult(DownloadOutcome.RETRYABLE, error="binary download")
-            digest = hashlib.sha256(data).hexdigest()
-        except OSError as exc:
-            return DownloadResult(DownloadOutcome.RETRYABLE, error=f"hash failed: {exc}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            download.save_as(str(part))
+            try:
+                size = part.stat().st_size
+            except OSError as exc:
+                return DownloadResult(DownloadOutcome.RETRYABLE, error=f"stat failed: {exc}")
+            if size <= 0:
+                try:
+                    part.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                last_error = "empty download"
+                continue
 
-        part.replace(dest)
-        return DownloadResult(
-            DownloadOutcome.DOWNLOADED, path=dest, size=size, sha256=digest
-        )
-    finally:
-        _dismiss_menu(page)
+            try:
+                data = part.read_bytes()
+                if b"\x00" in data[:2048]:
+                    part.unlink(missing_ok=True)
+                    last_error = "binary download"
+                    continue
+                digest = hashlib.sha256(data).hexdigest()
+            except OSError as exc:
+                return DownloadResult(DownloadOutcome.RETRYABLE, error=f"hash failed: {exc}")
+
+            part.replace(dest)
+            return DownloadResult(
+                DownloadOutcome.DOWNLOADED, path=dest, size=size, sha256=digest
+            )
+        finally:
+            _dismiss_menu(page)
+
+    # Menu path failed — scrape transcript panel from the open note.
+    scraped = _extract_transcript_from_page(page)
+    if scraped:
+        return _write_text_download(dest, scraped)
+
+    detail = last_error
+    if menu_labels_seen:
+        preview = ", ".join(menu_labels_seen[:12])
+        detail = f"{last_error}; menu items: [{preview}]"
+    # Missing download action is often UI-shift, not true absence.
+    if "menu item missing" in last_error:
+        return DownloadResult(DownloadOutcome.SELECTOR_BROKEN, error=detail)
+    return DownloadResult(DownloadOutcome.ABSENT, error=detail)
 
 
 def _dismiss_menu(page: Page) -> None:
