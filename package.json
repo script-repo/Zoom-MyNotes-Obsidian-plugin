@@ -6,9 +6,23 @@
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "install-vault": "node esbuild.config.mjs production && node scripts/install-vault.mjs"
+    "install-vault": "npm run build && node scripts/install-vault.mjs"
   },
-  "keywords": ["obsidian", "zoom", "transcripts"],
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "zoom",
+    "transcripts"
+  ],
+  "author": "DaemonBehr",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/script-repo/Zoom-MyNotes-Obsidian-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/script-repo/Zoom-MyNotes-Obsidian-plugin/issues"
+  },
+  "homepage": "https://github.com/script-repo/Zoom-MyNotes-Obsidian-plugin#readme",
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.11.0",

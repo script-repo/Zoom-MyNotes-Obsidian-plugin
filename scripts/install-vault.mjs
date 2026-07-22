@@ -13,17 +13,16 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(__dirname, "..");
 
-const defaultVault =
-  process.env.ZOOM_OBSIDIAN_VAULT ||
-  path.join(
-    process.env.USERPROFILE || "",
-    "OneDrive - Nutanix",
-    "Documents",
-    "Obsidian Notes",
-    "Obsidian-brain-1"
+const vaultArg = process.argv[2] || process.env.ZOOM_OBSIDIAN_VAULT;
+if (!vaultArg) {
+  console.error(
+    "Usage: node scripts/install-vault.mjs <vaultPath>\n" +
+      "   or: set ZOOM_OBSIDIAN_VAULT and run npm run install-vault"
   );
+  process.exit(1);
+}
 
-const vault = path.resolve(process.argv[2] || defaultVault);
+const vault = path.resolve(vaultArg);
 const dest = path.join(vault, ".obsidian", "plugins", "zoom-mynotes-sync");
 
 const files = ["main.js", "manifest.json", "styles.css"];
