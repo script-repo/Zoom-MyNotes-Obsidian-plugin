@@ -115,11 +115,10 @@ def new_context(browser, use_saved_state: bool = True):
     problems that plague persistent contexts on Windows. The authenticated
     session is carried via STORAGE_STATE instead.
     """
-    downloads = TRANSCRIPTS_DIR / ".playwright-downloads"
-    downloads.mkdir(parents=True, exist_ok=True)
+    # Note: downloads_path is only valid on launch_persistent_context, not new_context.
+    # File downloads are saved via page.expect_download() + download.save_as(...).
     kwargs: dict = {
         "accept_downloads": True,
-        "downloads_path": str(downloads),
         "viewport": {"width": 1400, "height": 900},
         "locale": "en-US",
     }
