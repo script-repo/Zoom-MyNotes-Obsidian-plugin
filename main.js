@@ -555,7 +555,7 @@ def process_notes(page, index: IndexStore, lock: lockfile.LockHandle | None, sta
                 shown = str(dest.relative_to(config.TRANSCRIPTS_DIR))
             except ValueError:
                 shown = str(dest)
-            log.info("Downloaded transcript: %s -> %s", label, shown)
+            log.info("Saved note content: %s -> %s", label, shown)
         elif result.outcome == DownloadOutcome.ABSENT:
             index.add(
                 note_id,
@@ -967,12 +967,21 @@ def new_context(browser, use_saved_state: bool = True):
         "accept_downloads": True,
         "viewport": {"width": 1400, "height": 900},
         "locale": "en-US",
+        # Required for Zoom "Copy page content" \u2192 clipboard workflow.
+        "permissions": ["clipboard-read", "clipboard-write"],
     }
     if use_saved_state and STORAGE_STATE.exists():
         kwargs["storage_state"] = str(STORAGE_STATE)
     ctx = browser.new_context(**kwargs)
     ctx.set_default_navigation_timeout(NAV_TIMEOUT_MS)
     ctx.set_default_timeout(ACTION_TIMEOUT_MS)
+    try:
+        ctx.grant_permissions(
+            ["clipboard-read", "clipboard-write"],
+            origin="https://docs.zoom.us",
+        )
+    except Exception:
+        pass
     return ctx
 
 
@@ -1156,9 +1165,13 @@ def prune_old_logs(directory: Path = None, retention_days: int = None) -> int:
 `,
   "zoom_notes.py": `"""Playwright page helpers for the Zoom Notes (docs.zoom.us/notes) UI.
 
-Selectors are centralized and role/text based where possible. Extraction returns
-structured outcomes so transient failures are not permanently classified as
-"no transcript".
+Workflow (Zoom no longer offers Download transcript):
+  1. Open My Notes list at docs.zoom.us/notes
+  2. Open each note
+  3. Top-right \u22EE menu \u2192 "Copy page content"
+  4. Read clipboard and save as the transcript file
+
+Selectors are centralized and role/text based where possible.
 """
 
 from __future__ import annotations
@@ -1204,19 +1217,12 @@ SELECTORS = {
         'button[data-testid*="more" i]',
         'button[data-testid*="menu" i]',
     ],
-    "download_transcript": [
-        '[role="menuitem"]:has-text("Download transcript")',
-        '[role="menuitem"]:has-text("Download Transcript")',
-        '[role="menuitem"]:has-text("Export transcript")',
-        '[role="menuitem"]:has-text("Export Transcript")',
-        '[role="menuitem"]:has-text("Download as")',
-        '[role="menuitem"]:has-text("transcript")',
-        'text="Download transcript"',
-        'text="Download Transcript"',
-        'text=/download\\\\s+transcript/i',
-        'text=/export\\\\s+transcript/i',
-        'button:has-text("Download transcript")',
-        'a:has-text("Download transcript")',
+    "copy_page_content": [
+        '[role="menuitem"]:has-text("Copy page content")',
+        '[role="menuitem"]:has-text("Copy Page Content")',
+        'text="Copy page content"',
+        'text=/copy\\\\s+page\\\\s+content/i',
+        'button:has-text("Copy page content")',
     ],
     "transcript_tab": [
         '[role="tab"]:has-text("Transcript")',
@@ -1659,7 +1665,7 @@ def _wait_opened(page: Page, note: NoteRef) -> None:
             )
 
     if kebab is None and not shown and not _page_shows_title(page, note.title):
-        # Still proceed; download_transcript will report selector_broken/retryable.
+        # Still proceed; copy-page-content will report selector issues.
         page.wait_for_timeout(500)
 
 
@@ -1722,7 +1728,7 @@ def _menuitem_by_name(page: Page, pattern: re.Pattern[str]) -> Optional[Locator]
 
 
 def _all_kebabs(page: Page) -> List[Locator]:
-    """Return distinct visible kebab/more buttons (main content preferred)."""
+    """Return distinct visible \u22EE / More buttons; top-right preferred."""
     found: List[Locator] = []
     seen: Set[str] = set()
     for sel in SELECTORS["kebab"]:
@@ -1750,22 +1756,21 @@ def _all_kebabs(page: Page) -> List[Locator]:
             found.append(item)
 
     def _sort_key(el: Locator) -> tuple:
+        # Prefer upper-right chrome (page options), not sidebar.
         try:
-            box = el.bounding_box() or {"x": 0, "y": 0}
-            return (-float(box.get("x", 0)), float(box.get("y", 0)))
+            box = el.bounding_box() or {"x": 0, "y": 9999}
+            return (float(box.get("y", 9999)), -float(box.get("x", 0)))
         except PWError:
-            return (0.0, 0.0)
+            return (9999.0, 0.0)
 
     found.sort(key=_sort_key)
     return found
 
 
 def _write_text_download(dest: Path, text: str) -> DownloadResult:
-    import hashlib
-
     body = (text or "").strip()
-    if len(body) < 40:
-        return DownloadResult(DownloadOutcome.ABSENT, error="extracted transcript too short")
+    if len(body) < 20:
+        return DownloadResult(DownloadOutcome.ABSENT, error="copied page content too short")
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
     data = (body + "\\n").encode("utf-8")
@@ -1780,140 +1785,84 @@ def _write_text_download(dest: Path, text: str) -> DownloadResult:
     )
 
 
-_SPEAKER_LINE = re.compile(
-    r"^(?P<span>.{1,80}?)\\s*[:\\-\u2013\u2014]\\s+.+$|"
-    r"^\\[[0-9:.]+\\]\\s*.+$|"
-    r"^[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?\\s+.+$",
-    re.M,
-)
-
-
-def _looks_like_transcript(text: str) -> bool:
-    body = (text or "").strip()
-    if len(body) < 80:
-        return False
-    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-    if len(lines) < 4:
-        return False
-    speaker_hits = len(_SPEAKER_LINE.findall(body))
-    if speaker_hits >= 2:
-        return True
-    # Long multi-line body from an opened note is still useful.
-    return len(lines) >= 8 and len(body) >= 300
-
-
-def _extract_transcript_from_page(page: Page) -> str:
-    """Best-effort scrape of an on-page Transcript / AI notes panel."""
-    # Open Transcript tab if present.
-    for sel in SELECTORS["transcript_tab"]:
-        try:
-            loc = page.locator(sel)
-            count = min(loc.count(), 6)
-        except PWError:
-            continue
-        for i in range(count):
-            try:
-                tab = loc.nth(i)
-                if not tab.is_visible():
-                    continue
-                label = _clean(tab.inner_text(timeout=500)).lower()
-                if "transcript" not in label and i > 0:
-                    continue
-                err = _safe_click(tab, timeout_ms=3000)
-                if err is None:
-                    page.wait_for_timeout(1200)
-                    break
-            except PWError:
-                continue
-
-    container_sels = [
-        '[data-testid*="transcript" i]',
-        '[class*="transcript" i]',
-        '[aria-label*="transcript" i]',
-        '[class*="Transcript" i]',
-        'section:has-text("Transcript")',
-        'article',
-        '[role="article"]',
-        'main',
-        '[role="main"]',
-        '[contenteditable="true"]',
-    ]
-    best = ""
-    for sel in container_sels:
-        try:
-            loc = page.locator(sel)
-            count = min(loc.count(), 10)
-        except PWError:
-            continue
-        for i in range(count):
-            try:
-                item = loc.nth(i)
-                if not item.is_visible():
-                    continue
-                text = item.inner_text(timeout=2500)
-            except PWError:
-                continue
-            text = (text or "").strip()
-            lines = [
-                ln
-                for ln in text.splitlines()
-                if _clean(ln).lower() not in OPENED_TITLE_DENYLIST | NAV_DENYLIST
-            ]
-            candidate = "\\n".join(lines).strip()
-            if not _looks_like_transcript(candidate):
-                continue
-            if len(candidate) > len(best):
-                best = candidate
-        if len(best) > 800:
-            break
-
-    if best:
-        return best
-
-    # Whole-page fallback (filtered).
+def _clear_clipboard(page: Page) -> None:
     try:
-        raw = page.locator("body").inner_text(timeout=3000)
+        page.evaluate(
+            """async () => {
+                try { await navigator.clipboard.writeText(''); } catch (e) {}
+            }"""
+        )
     except PWError:
-        return ""
-    lines = [
-        ln
-        for ln in (raw or "").splitlines()
-        if _clean(ln).lower() not in OPENED_TITLE_DENYLIST | NAV_DENYLIST
-    ]
-    candidate = "\\n".join(lines).strip()
-    return candidate if _looks_like_transcript(candidate) else ""
+        pass
 
 
-def _try_menu_download(page: Page, dest: Path) -> DownloadResult:
-    """Open kebabs / export menus and attempt a real file download."""
-    import hashlib
+def _read_clipboard(page: Page) -> str:
+    """Read text from the system clipboard via the page context."""
+    try:
+        text = page.evaluate(
+            """async () => {
+                try {
+                    return await navigator.clipboard.readText();
+                } catch (e) {
+                    return '';
+                }
+            }"""
+        )
+        if isinstance(text, str) and text.strip():
+            return text
+    except PWError:
+        pass
+    return ""
 
-    name_patterns = (
-        re.compile(r"download\\s+transcript", re.I),
-        re.compile(r"export\\s+transcript", re.I),
-        re.compile(r"download\\s+.*\\.txt", re.I),
-        re.compile(r"transcript\\s*\\(.*txt.*\\)", re.I),
-        re.compile(r"^transcript$", re.I),
+
+def _find_copy_page_content_item(page: Page) -> Optional[Locator]:
+    """Locate the Zoom 'Copy page content' menu item."""
+    patterns = (
+        re.compile(r"copy\\s+page\\s+content", re.I),
+        re.compile(r"copy\\s+content", re.I),
+        re.compile(r"copy\\s+page", re.I),
     )
-    export_patterns = (
-        re.compile(r"^export$", re.I),
-        re.compile(r"^download$", re.I),
-        re.compile(r"export\\s+as", re.I),
-        re.compile(r"download\\s+as", re.I),
-    )
+    for pat in patterns:
+        item = _menuitem_by_name(page, pat)
+        if item is not None:
+            return item
+    item = _first_usable(page, SELECTORS["copy_page_content"])
+    if item is not None:
+        return item
+    # Last resort: any visible control whose text matches.
+    try:
+        loc = page.get_by_text(re.compile(r"copy\\s+page\\s+content", re.I))
+        if loc.count() > 0 and loc.first.is_visible():
+            return loc.first
+    except PWError:
+        pass
+    return None
+
+
+def _try_copy_page_content(page: Page, dest: Path) -> DownloadResult:
+    """\u22EE \u2192 Copy page content \u2192 clipboard \u2192 file."""
+    try:
+        page.context.grant_permissions(
+            ["clipboard-read", "clipboard-write"],
+            origin="https://docs.zoom.us",
+        )
+    except Exception:
+        pass
 
     kebabs = _all_kebabs(page)
     if not kebabs:
-        return DownloadResult(DownloadOutcome.SELECTOR_BROKEN, error="kebab not found")
+        return DownloadResult(DownloadOutcome.SELECTOR_BROKEN, error="page options (\u22EE) not found")
 
     menu_labels_seen: List[str] = []
-    last_error = "download menu item missing"
+    last_error = "Copy page content menu item missing"
 
-    for kebab in kebabs[:5]:
+    for kebab in kebabs[:6]:
         _dismiss_menu(page)
+        _clear_clipboard(page)
+
         err = _safe_click(kebab)
         if err:
-            last_error = f"kebab click: {err}"
+            last_error = f"\u22EE click failed: {err}"
             continue
 
         page.wait_for_timeout(700)
@@ -1921,78 +1870,36 @@ def _try_menu_download(page: Page, dest: Path) -> DownloadResult:
             if lab not in menu_labels_seen:
                 menu_labels_seen.append(lab)
 
-        # Nested Export/Download menus first.
-        for exp_pat in export_patterns:
-            exp = _menuitem_by_name(page, exp_pat)
-            if exp is None:
-                continue
-            exp_err = _safe_click(exp)
-            if exp_err:
-                continue
-            page.wait_for_timeout(600)
-            for lab in _menu_item_labels(page):
-                if lab not in menu_labels_seen:
-                    menu_labels_seen.append(lab)
+        target = _find_copy_page_content_item(page)
+        if target is None:
+            last_error = "Copy page content menu item missing"
+            _dismiss_menu(page)
+            continue
 
-        target: Optional[Locator] = None
-        for pat in name_patterns:
-            target = _menuitem_by_name(page, pat)
-            if target is not None:
+        click_err = _safe_click(target, timeout_ms=4000)
+        if click_err:
+            last_error = f"Copy page content click failed: {click_err}"
+            _dismiss_menu(page)
+            continue
+
+        # Clipboard write is async after the menu action.
+        text = ""
+        for _ in range(10):
+            page.wait_for_timeout(250)
+            text = _read_clipboard(page)
+            if text.strip():
                 break
-        if target is None:
-            # Fallback CSS selectors (stable .first, not nth index).
-            target = _first_usable(page, SELECTORS["download_transcript"])
-        if target is None:
-            last_error = "download menu item missing"
-            _dismiss_menu(page)
+
+        _dismiss_menu(page)
+
+        if not text.strip():
+            last_error = "clipboard empty after Copy page content"
             continue
 
-        part = dest.with_suffix(dest.suffix + ".part")
-        if part.exists():
-            try:
-                part.unlink()
-            except OSError:
-                pass
-
-        try:
-            with page.expect_download(timeout=min(20000, config.DOWNLOAD_TIMEOUT_MS)) as dl_info:
-                click_err = _safe_click(target, timeout_ms=4000)
-                if click_err:
-                    raise PWTimeoutError(click_err)
-            download = dl_info.value
-        except PWTimeoutError as exc:
-            last_error = f"download/click timeout: {exc}"
-            _dismiss_menu(page)
-            continue
-        except PWError as exc:
-            last_error = f"download error: {exc}"
-            _dismiss_menu(page)
-            continue
-
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            download.save_as(str(part))
-            size = part.stat().st_size
-            if size <= 0:
-                part.unlink(missing_ok=True)
-                last_error = "empty download"
-                _dismiss_menu(page)
-                continue
-            data = part.read_bytes()
-            if b"\\x00" in data[:2048]:
-                part.unlink(missing_ok=True)
-                last_error = "binary download"
-                _dismiss_menu(page)
-                continue
-            digest = hashlib.sha256(data).hexdigest()
-            part.replace(dest)
-            _dismiss_menu(page)
-            return DownloadResult(
-                DownloadOutcome.DOWNLOADED, path=dest, size=size, sha256=digest
-            )
-        except OSError as exc:
-            _dismiss_menu(page)
-            return DownloadResult(DownloadOutcome.RETRYABLE, error=f"save failed: {exc}")
+        result = _write_text_download(dest, text)
+        if result.outcome == DownloadOutcome.DOWNLOADED:
+            return result
+        last_error = result.error or "write failed"
 
     detail = last_error
     if menu_labels_seen:
@@ -2000,27 +1907,53 @@ def _try_menu_download(page: Page, dest: Path) -> DownloadResult:
     return DownloadResult(DownloadOutcome.RETRYABLE, error=detail)
 
 
+def _extract_transcript_from_page(page: Page) -> str:
+    """Fallback: scrape main note body if clipboard copy fails."""
+    container_sels = [
+        "article",
+        '[role="article"]',
+        "main",
+        '[role="main"]',
+        '[contenteditable="true"]',
+    ]
+    best = ""
+    for sel in container_sels:
+        try:
+            loc = page.locator(sel)
+            count = min(loc.count(), 8)
+        except PWError:
+            continue
+        for i in range(count):
+            try:
+                item = loc.nth(i)
+                if not item.is_visible():
+                    continue
+                text = (item.inner_text(timeout=2500) or "").strip()
+            except PWError:
+                continue
+            if len(text) > len(best):
+                best = text
+        if len(best) > 400:
+            break
+    return best
+
+
 def download_transcript(page: Page, dest: Path) -> DownloadResult:
-    """Prefer on-page transcript scrape; fall back to menu file download."""
-    # AI Companion notes usually render transcript/summary in the open view.
+    """Capture note content via Zoom 'Copy page content' (primary workflow).
+
+    Kept name for sync.py compatibility. No longer uses Download transcript.
+    """
+    copy_result = _try_copy_page_content(page, dest)
+    if copy_result.outcome == DownloadOutcome.DOWNLOADED:
+        return copy_result
+
+    # Fallback scrape of the open note body.
     scraped = _extract_transcript_from_page(page)
-    if scraped:
+    if scraped and len(scraped.strip()) >= 40:
         return _write_text_download(dest, scraped)
 
-    menu_result = _try_menu_download(page, dest)
-    if menu_result.outcome == DownloadOutcome.DOWNLOADED:
-        return menu_result
-
-    # Scrape again after menus may have revealed panels.
-    scraped = _extract_transcript_from_page(page)
-    if scraped:
-        return _write_text_download(dest, scraped)
-
-    # Keep retryable so backoff is short and next run tries again.
-    if menu_result.outcome != DownloadOutcome.DOWNLOADED:
-        save_diagnostics(page, f"no-transcript-{dest.stem[:40]}")
-        return menu_result
-    return DownloadResult(DownloadOutcome.ABSENT, error="no transcript content found")
+    save_diagnostics(page, f"copy-fail-{dest.stem[:40]}")
+    return copy_result
 
 
 def _dismiss_menu(page: Page) -> None:
@@ -2179,8 +2112,11 @@ class IndexStore:
         """Re-open notes wrongly marked absent due to UI/menu selector misses."""
         markers = (
             "download menu item missing",
+            "copy page content",
+            "clipboard empty",
             "menu items:",
             "kebab not found",
+            "page options",
             "download/click timeout",
             "download timeout",
             "locator.click",

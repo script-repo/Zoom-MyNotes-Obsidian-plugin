@@ -121,12 +121,21 @@ def new_context(browser, use_saved_state: bool = True):
         "accept_downloads": True,
         "viewport": {"width": 1400, "height": 900},
         "locale": "en-US",
+        # Required for Zoom "Copy page content" → clipboard workflow.
+        "permissions": ["clipboard-read", "clipboard-write"],
     }
     if use_saved_state and STORAGE_STATE.exists():
         kwargs["storage_state"] = str(STORAGE_STATE)
     ctx = browser.new_context(**kwargs)
     ctx.set_default_navigation_timeout(NAV_TIMEOUT_MS)
     ctx.set_default_timeout(ACTION_TIMEOUT_MS)
+    try:
+        ctx.grant_permissions(
+            ["clipboard-read", "clipboard-write"],
+            origin="https://docs.zoom.us",
+        )
+    except Exception:
+        pass
     return ctx
 
 

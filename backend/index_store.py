@@ -132,8 +132,11 @@ class IndexStore:
         """Re-open notes wrongly marked absent due to UI/menu selector misses."""
         markers = (
             "download menu item missing",
+            "copy page content",
+            "clipboard empty",
             "menu items:",
             "kebab not found",
+            "page options",
             "download/click timeout",
             "download timeout",
             "locator.click",

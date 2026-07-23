@@ -374,7 +374,7 @@ def process_notes(page, index: IndexStore, lock: lockfile.LockHandle | None, sta
                 shown = str(dest.relative_to(config.TRANSCRIPTS_DIR))
             except ValueError:
                 shown = str(dest)
-            log.info("Downloaded transcript: %s -> %s", label, shown)
+            log.info("Saved note content: %s -> %s", label, shown)
         elif result.outcome == DownloadOutcome.ABSENT:
             index.add(
                 note_id,
