@@ -19,3 +19,32 @@ dist/
 # Local env
 .env
 .env.*
+local-env.ps1
+local-env.sh
+
+# Auth session / runtime secrets (never commit — treat like a password)
+storage_state.json
+storage_state.json.bak
+storage_state.json.tmp
+.browser-profile/
+sync.lock
+sync.lock.tmp
+*.lock
+
+# Backend runtime artifacts
+data/
+logs/
+.last-sync
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Machine-local caches / runtime artifacts
+.playwright/
+.runtime-home/
+Microsoft/
+pip/

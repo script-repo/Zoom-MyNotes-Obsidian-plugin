@@ -1,6 +1,6 @@
 {
   "name": "zoom-mynotes-sync",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Deploy and control Zoom Notes transcript sync from Obsidian",
   "main": "main.js",
   "scripts": {

@@ -1,10 +1,11 @@
 """Playwright page helpers for the Zoom Notes (docs.zoom.us/notes) UI.
 
-Workflow (Zoom no longer offers Download transcript):
+Workflow:
   1. Open My Notes list at docs.zoom.us/notes
   2. Open each note
-  3. Top-right ⋮ menu → "Copy page content"
-  4. Read clipboard and save as the transcript file
+  3. Top-right ⋮ menu → "Copy page content" (the note summary)
+  4. Top-right ⋮ menu → "Download transcript" (the raw transcript, when available)
+  5. Save one .md file: summary on top, raw transcript appended at the bottom
 
 Selectors are centralized and role/text based where possible.
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -58,6 +60,13 @@ SELECTORS = {
         'text="Copy page content"',
         'text=/copy\\s+page\\s+content/i',
         'button:has-text("Copy page content")',
+    ],
+    "download_transcript": [
+        '[role="menuitem"]:has-text("Download transcript")',
+        '[role="menuitem"]:has-text("Download Transcript")',
+        'text="Download transcript"',
+        'text=/download\\s+transcript/i',
+        'button:has-text("Download transcript")',
     ],
     "transcript_tab": [
         '[role="tab"]:has-text("Transcript")',
@@ -124,6 +133,7 @@ class DownloadResult:
     size: int = 0
     sha256: str = ""
     error: str = ""
+    has_transcript: bool = False
 
 
 class OpenMismatchError(RuntimeError):
@@ -674,8 +684,14 @@ def _find_copy_page_content_item(page: Page) -> Optional[Locator]:
     return None
 
 
-def _try_copy_page_content(page: Page, dest: Path) -> DownloadResult:
-    """⋮ → Copy page content → clipboard → file."""
+def _capture_summary_text(page: Page) -> tuple[str, str, str]:
+    """⋮ → Copy page content → clipboard.
+
+    Returns (text, status, detail). status is one of:
+      "ok"              text captured
+      "selector_broken" page options (⋮) never found
+      "retryable"       menu/clipboard failed after retries
+    """
     try:
         page.context.grant_permissions(
             ["clipboard-read", "clipboard-write"],
@@ -686,7 +702,7 @@ def _try_copy_page_content(page: Page, dest: Path) -> DownloadResult:
 
     kebabs = _all_kebabs(page)
     if not kebabs:
-        return DownloadResult(DownloadOutcome.SELECTOR_BROKEN, error="page options (⋮) not found")
+        return "", "selector_broken", "page options (⋮) not found"
 
     menu_labels_seen: List[str] = []
     last_error = "Copy page content menu item missing"
@@ -731,15 +747,117 @@ def _try_copy_page_content(page: Page, dest: Path) -> DownloadResult:
             last_error = "clipboard empty after Copy page content"
             continue
 
-        result = _write_text_download(dest, text)
-        if result.outcome == DownloadOutcome.DOWNLOADED:
-            return result
-        last_error = result.error or "write failed"
+        return text, "ok", ""
 
     detail = last_error
     if menu_labels_seen:
         detail = f"{last_error}; menu items: [{', '.join(menu_labels_seen[:12])}]"
-    return DownloadResult(DownloadOutcome.RETRYABLE, error=detail)
+    return "", "retryable", detail
+
+
+def _is_disabled(locator: Locator) -> bool:
+    """True if a menu item is present but disabled/greyed out."""
+    try:
+        aria = locator.get_attribute("aria-disabled")
+        if aria and aria.strip().lower() in ("true", "1"):
+            return True
+    except PWError:
+        pass
+    try:
+        if locator.get_attribute("disabled") is not None:
+            return True
+    except PWError:
+        pass
+    try:
+        if not locator.is_enabled():
+            return True
+    except PWError:
+        pass
+    return False
+
+
+def _find_download_transcript_item(page: Page) -> Optional[Locator]:
+    """Locate the Zoom 'Download transcript' menu item."""
+    item = _menuitem_by_name(page, re.compile(r"download\s+transcript", re.I))
+    if item is not None:
+        return item
+    return _first_usable(page, SELECTORS["download_transcript"])
+
+
+def _capture_raw_transcript(page: Page) -> tuple[str, str, str]:
+    """⋮ → Download transcript → captured download file text.
+
+    Returns (text, status, detail). status is one of:
+      "ok"        transcript text captured
+      "absent"    the menu item is missing or greyed out (no transcript)
+      "retryable" the item was present but the download failed
+    """
+    kebabs = _all_kebabs(page)
+    if not kebabs:
+        return "", "absent", "page options (⋮) not found"
+
+    last_error = "Download transcript menu item missing"
+    saw_item = False
+
+    for kebab in kebabs[:6]:
+        _dismiss_menu(page)
+
+        err = _safe_click(kebab)
+        if err:
+            last_error = f"⋮ click failed: {err}"
+            continue
+
+        page.wait_for_timeout(700)
+        target = _find_download_transcript_item(page)
+        if target is None:
+            last_error = "Download transcript menu item missing"
+            _dismiss_menu(page)
+            continue
+
+        saw_item = True
+        if _is_disabled(target):
+            last_error = "Download transcript disabled (no transcript for this note)"
+            _dismiss_menu(page)
+            return "", "absent", last_error
+
+        text = ""
+        try:
+            with page.expect_download(timeout=config.DOWNLOAD_TIMEOUT_MS) as dl_info:
+                click_err = _safe_click(target, timeout_ms=4000)
+                if click_err:
+                    raise PWError(click_err)
+            download = dl_info.value
+            tmp = config.DATA_DIR / f".transcript-{uuid.uuid4().hex}.tmp"
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            download.save_as(str(tmp))
+            try:
+                text = tmp.read_text(encoding="utf-8", errors="replace")
+            finally:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        except (PWTimeoutError, PWError) as exc:
+            last_error = f"Download transcript failed: {str(exc)[:200]}"
+            _dismiss_menu(page)
+            continue
+
+        _dismiss_menu(page)
+        if text.strip():
+            return text, "ok", ""
+        last_error = "downloaded transcript was empty"
+
+    status = "retryable" if saw_item else "absent"
+    return "", status, last_error
+
+
+def _compose_markdown(summary: str, transcript: str) -> str:
+    """Summary on top; raw transcript appended under a heading when present."""
+    body = (summary or "").strip()
+    tx = (transcript or "").strip()
+    if tx:
+        body = f"{body}\n\n---\n\n## Raw transcript\n\n{tx}"
+    return body
 
 
 def _extract_transcript_from_page(page: Page) -> str:
@@ -774,21 +892,36 @@ def _extract_transcript_from_page(page: Page) -> str:
 
 
 def download_transcript(page: Page, dest: Path) -> DownloadResult:
-    """Capture note content via Zoom 'Copy page content' (primary workflow).
+    """Capture a note as one .md: summary (Copy page content) + raw transcript.
 
-    Kept name for sync.py compatibility. No longer uses Download transcript.
+    Kept name for sync.py compatibility. The summary is captured first, then the
+    raw transcript via the 'Download transcript' menu item (when available) is
+    appended at the bottom under a heading.
     """
-    copy_result = _try_copy_page_content(page, dest)
-    if copy_result.outcome == DownloadOutcome.DOWNLOADED:
-        return copy_result
+    summary, s_status, s_detail = _capture_summary_text(page)
 
-    # Fallback scrape of the open note body.
-    scraped = _extract_transcript_from_page(page)
-    if scraped and len(scraped.strip()) >= 40:
-        return _write_text_download(dest, scraped)
+    if not summary.strip():
+        # Fallback scrape of the open note body.
+        scraped = _extract_transcript_from_page(page)
+        if scraped and len(scraped.strip()) >= 40:
+            summary = scraped
+            s_status = "ok"
 
-    save_diagnostics(page, f"copy-fail-{dest.stem[:40]}")
-    return copy_result
+    if not summary.strip():
+        save_diagnostics(page, f"copy-fail-{dest.stem[:40]}")
+        outcome = (
+            DownloadOutcome.SELECTOR_BROKEN
+            if s_status == "selector_broken"
+            else DownloadOutcome.RETRYABLE
+        )
+        return DownloadResult(outcome, error=s_detail or "summary capture failed")
+
+    transcript, t_status, _t_detail = _capture_raw_transcript(page)
+
+    body = _compose_markdown(summary, transcript)
+    result = _write_text_download(dest, body)
+    result.has_transcript = bool(transcript.strip()) and t_status == "ok"
+    return result
 
 
 def _dismiss_menu(page: Page) -> None:

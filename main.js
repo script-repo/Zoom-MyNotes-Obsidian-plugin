@@ -179,2487 +179,2680 @@ var path4 = __toESM(require("path"));
 
 // src/backendBundle.generated.ts
 var BACKEND_FILES = {
-  "sync.py": `"""Scheduled sync entry point.
-
-Run every 30 minutes (via Task Scheduler / run.ps1). Loads the saved session,
-scans Zoom notes, downloads transcripts not already in the index, and records
-results. Expired sessions trigger interactive re-login in a separate browser
-lifecycle, then a fresh sync session continues.
-
-By default Playwright work runs in an isolated child process so hung Edge
-teardown cannot pin the lock forever.
-
-Exit codes:
-  0 success
-  1 hard failure
-  2 degraded (partial failures / selector issues)
-  3 skipped (lock held by healthy peer)
-
-    python sync.py
-    python sync.py --worker   # internal: browser phase only (no lock)
-"""
-
-from __future__ import annotations
-
-import logging
-import os
-import re
-import subprocess
-import sys
-import time
-import uuid
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-
-import config
-import lockfile
-import login as login_module
-import procs
-import security
-import zoom_notes
-from index_store import (
-    STATUS_DOWNLOADED,
-    STATUS_NO_TRANSCRIPT,
-    STATUS_RETRYABLE,
-    IndexCorruptError,
-    IndexStore,
-)
-from zoom_notes import DownloadOutcome, OpenMismatchError
-
-log = logging.getLogger("zoom_sync")
-
-EXIT_OK = 0
-EXIT_HARD = 1
-EXIT_DEGRADED = 2
-EXIT_LOCKED = 3
-
-
-@dataclass
-class RunStats:
-    scanned: int = 0
-    opened: int = 0
-    downloaded: int = 0
-    absent: int = 0
-    retryable: int = 0
-    failed: int = 0
-    skipped_known: int = 0
-    selector_broken: int = 0
-    orphans: int = 0
-
-    def summary(self, index_size: int, code: int) -> str:
-        return (
-            f"scanned={self.scanned} opened={self.opened} downloaded={self.downloaded} "
-            f"absent={self.absent} retryable={self.retryable} selector_broken={self.selector_broken} "
-            f"failed={self.failed} skipped_known={self.skipped_known} orphans={self.orphans} "
-            f"index={index_size} exit={code}"
-        )
-
-
-def setup_logging() -> None:
-    config.ensure_dirs()
-    logfile = config.LOGS_DIR / f"sync-{datetime.now():%Y%m%d}.log"
-    handlers = [logging.FileHandler(logfile, encoding="utf-8"), logging.StreamHandler(sys.stdout)]
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=handlers,
-        force=True,
-    )
-
-
-_MONTH_ABBR = {
-    "jan": 1,
-    "feb": 2,
-    "mar": 3,
-    "apr": 4,
-    "may": 5,
-    "jun": 6,
-    "jul": 7,
-    "aug": 8,
-    "sep": 9,
-    "oct": 10,
-    "nov": 11,
-    "dec": 12,
-}
-
-
-def _parse_meeting_date(
-    note: zoom_notes.NoteRef, *, today: datetime | None = None
-) -> datetime:
-    """Best-effort calendar day for path/filename (date part only; time ignored).
-
-    Prefer ISO yyyy-mm-dd in the title (Zoom often embeds it), then the list-row
-    date text (e.g. 'Monday Jul 20, 13:58-14:51'), else today.
-    """
-    now = (today or datetime.now()).date()
-    for text in (note.title or "", note.date or ""):
-        m = re.search(r"(20\\d{2})-(\\d{2})-(\\d{2})", text)
-        if m:
-            try:
-                return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-            except ValueError:
-                pass
-
-    raw = note.date or ""
-    m = re.search(
-        r"\\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\\s+"
-        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\\s+"
-        r"(\\d{1,2})\\b",
-        raw,
-        re.IGNORECASE,
-    )
-    if m:
-        month = _MONTH_ABBR[m.group(1)[:3].lower()]
-        day = int(m.group(2))
-        year = now.year
-        try:
-            candidate = datetime(year, month, day).date()
-        except ValueError:
-            candidate = None
-        if candidate is not None:
-            # UI omits year; if the day is far in the future, it was last year.
-            if (candidate - now).days > 180:
-                try:
-                    candidate = datetime(year - 1, month, day).date()
-                except ValueError:
-                    candidate = None
-            if candidate is not None:
-                return datetime(candidate.year, candidate.month, candidate.day)
-
-    m = re.search(
-        r"\\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
-        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|"
-        r"Dec(?:ember)?)\\s+(\\d{1,2})(?:st|nd|rd|th)?"
-        r"(?:,?\\s*)?(20\\d{2})?\\b",
-        note.title or "",
-        re.IGNORECASE,
-    )
-    if m:
-        month = _MONTH_ABBR[m.group(1)[:3].lower()]
-        day = int(m.group(2))
-        year = int(m.group(3)) if m.group(3) else now.year
-        try:
-            return datetime(year, month, day)
-        except ValueError:
-            pass
-
-    return datetime(now.year, now.month, now.day)
-
-
-def _safe_name(note: zoom_notes.NoteRef, meeting_day: datetime | None = None) -> str:
-    day = meeting_day or _parse_meeting_date(note)
-    prefix = f"{day:%Y-%m-%d}"
-    note_id = note.stable_id()
-    if config.PRIVACY_FILENAMES:
-        return f"{prefix}-{note_id}.md"
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", note.title).strip("_")[:80] or "note"
-    return f"{prefix}-{slug}__{note_id}.md"
-
-
-def _transcript_dest(note: zoom_notes.NoteRef) -> Path:
-    """Month folder under TRANSCRIPTS_DIR: {yyyy-mm}/{yyyy-mm-dd}-{name}.md"""
-    day = _parse_meeting_date(note)
-    return config.TRANSCRIPTS_DIR / f"{day:%Y-%m}" / _safe_name(note, day)
-
-
-def _note_ids(note: zoom_notes.NoteRef) -> list[str]:
-    ids = [note.metadata_id()]
-    if note.note_id:
-        ids.append(note.note_id)
-    sid = note.stable_id()
-    if sid not in ids:
-        ids.append(sid)
-    return ids
-
-
-def _is_due(note: zoom_notes.NoteRef, index: IndexStore) -> bool:
-    return any(index.should_process(i) for i in _note_ids(note))
-
-
-def _order_notes_for_processing(
-    notes: list[zoom_notes.NoteRef], index: IndexStore
-) -> list[zoom_notes.NoteRef]:
-    """Process every due note first (newest-first), then optional backfill candidates.
-
-    Never bury new top-of-list notes behind known ones \u2014 that interacted badly with
-    STOP_AFTER_KNOWN and skipped fresh meetings.
-    """
-    due: list[zoom_notes.NoteRef] = []
-    known: list[zoom_notes.NoteRef] = []
-    for note in notes:
-        if _is_due(note, index):
-            due.append(note)
-        else:
-            known.append(note)
-
-    # Among known-only tail, optionally rotate from watermark for future backfill
-    # discovery logging; we do not open known notes unless should_process says so.
-    marks = set(index.watermark_ids())
-    if marks and known:
-        cut = None
-        for i, note in enumerate(known):
-            if note.metadata_id() in marks or note.stable_id() in marks:
-                cut = i
-                break
-        if cut is not None and cut > 0:
-            known = known[cut:] + known[:cut]
-    return due + known
-
-
-def process_notes(page, index: IndexStore, lock: lockfile.LockHandle | None, stats: RunStats) -> int:
-    """Scan and download. Returns EXIT_OK or EXIT_DEGRADED."""
-    notes = zoom_notes.collect_notes(page, config.MAX_ITEMS, config.MAX_SCROLL_STEPS)
-    notes = _order_notes_for_processing(notes, index)
-    stats.scanned = len(notes)
-    due_count = sum(1 for n in notes if _is_due(n, index))
-    log.info("Found %d note(s) after scan/scroll (%d due).", len(notes), due_count)
-    if not notes:
-        if zoom_notes.is_logged_in(page):
-            log.warning(
-                "No meeting notes parsed while authenticated. "
-                "Selectors may need updating (see zoom_notes.SELECTORS)."
-            )
-            zoom_notes.save_diagnostics(page, f"empty-list-{datetime.now():%H%M%S}")
-            return EXIT_DEGRADED
-        log.error("Not authenticated and no notes found.")
-        return EXIT_HARD
-
-    consecutive_known = 0
-    work_budget = config.MAX_ITEMS
-    degraded = False
-    last_processed_ids: list[str] = []
-    reached_end = True
-    due_remaining = due_count
-
-    for note in notes:
-        if work_budget <= 0:
-            log.info("Work budget (%d) exhausted; remaining notes deferred.", config.MAX_ITEMS)
-            reached_end = False
-            break
-
-        if lock is not None:
-            try:
-                lock.heartbeat()
-            except Exception:
-                pass
-
-        pre_ids = _note_ids(note)
-        if not _is_due(note, index):
-            consecutive_known += 1
-            stats.skipped_known += 1
-            last_processed_ids = pre_ids[:3]
-            # Only stop early when no due notes remain later in the queue.
-            if due_remaining <= 0 and consecutive_known >= config.STOP_AFTER_KNOWN:
-                log.info("Hit %d consecutive known notes; stopping scan.", consecutive_known)
-                break
-            continue
-
-        due_remaining = max(0, due_remaining - 1)
-        label = config.note_label(note.metadata_id(), note.title)
-        log.info("Processing due note %s", label)
-        try:
-            zoom_notes.open_note(page, note)
-        except OpenMismatchError as exc:
-            log.error("Open mismatch for %s: %s", label, exc)
-            stats.failed += 1
-            degraded = True
-            consecutive_known = 0
-            work_budget -= 1
-            zoom_notes._dismiss_menu(page)
-            zoom_notes.save_diagnostics(page, f"mismatch-{note.metadata_id()}")
-            index.add(
-                note.metadata_id(),
-                title=note.title,
-                status=STATUS_RETRYABLE,
-                host=note.host,
-                meeting_date=note.date,
-                last_outcome="open_mismatch",
-                last_error=str(exc)[:300],
-            )
-            continue
-        except Exception as exc:  # noqa: BLE001
-            log.error("Failed to open note %s: %s", label, exc)
-            stats.failed += 1
-            degraded = True
-            consecutive_known = 0
-            work_budget -= 1
-            zoom_notes._dismiss_menu(page)
-            index.add(
-                note.metadata_id(),
-                title=note.title,
-                status=STATUS_RETRYABLE,
-                host=note.host,
-                meeting_date=note.date,
-                last_outcome="open_error",
-                last_error=str(exc)[:300],
-            )
-            continue
-
-        stats.opened += 1
-        work_budget -= 1
-        note_id = note.stable_id()
-        meta_id = note.metadata_id()
-        aliases = [a for a in _note_ids(note) if a != note_id]
-        last_processed_ids = _note_ids(note)[:3]
-
-        if not index.should_process(note_id) and not index.should_process(meta_id):
-            log.info("Already have %s (resolved). Skipping.", label)
-            consecutive_known += 1
-            stats.skipped_known += 1
-            if consecutive_known >= config.STOP_AFTER_KNOWN:
-                break
-            continue
-
-        consecutive_known = 0
-        dest = _transcript_dest(note)
-        try:
-            result = zoom_notes.download_transcript(page, dest)
-        except Exception as exc:  # noqa: BLE001
-            log.error("Download error for %s: %s", label, exc)
-            stats.failed += 1
-            degraded = True
-            index.add(
-                note_id,
-                title=note.title,
-                status=STATUS_RETRYABLE,
-                source_url=note.url,
-                host=note.host,
-                meeting_date=note.date,
-                aliases=aliases,
-                last_outcome="error",
-                last_error=str(exc)[:300],
-            )
-            continue
-
-        if result.outcome == DownloadOutcome.DOWNLOADED:
-            try:
-                rel = str(dest.relative_to(config.BASE_DIR))
-            except ValueError:
-                rel = str(dest)
-            index.add(
-                note_id,
-                title=note.title,
-                status=STATUS_DOWNLOADED,
-                source_url=note.url,
-                host=note.host,
-                meeting_date=note.date,
-                file=rel,
-                aliases=aliases,
-                size=result.size,
-                sha256=result.sha256,
-                last_outcome="downloaded",
-            )
-            stats.downloaded += 1
-            try:
-                shown = str(dest.relative_to(config.TRANSCRIPTS_DIR))
-            except ValueError:
-                shown = str(dest)
-            log.info("Saved note content: %s -> %s", label, shown)
-        elif result.outcome == DownloadOutcome.ABSENT:
-            index.add(
-                note_id,
-                title=note.title,
-                status=STATUS_NO_TRANSCRIPT,
-                source_url=note.url,
-                host=note.host,
-                meeting_date=note.date,
-                aliases=aliases,
-                last_outcome="absent",
-                last_error=result.error,
-            )
-            stats.absent += 1
-            log.info(
-                "No transcript for %s; backoff scheduled. (%s)",
-                label,
-                (result.error or "")[:200],
-            )
-        elif result.outcome == DownloadOutcome.SELECTOR_BROKEN:
-            index.add(
-                note_id,
-                title=note.title,
-                status=STATUS_RETRYABLE,
-                source_url=note.url,
-                host=note.host,
-                meeting_date=note.date,
-                aliases=aliases,
-                last_outcome="selector_broken",
-                last_error=result.error,
-            )
-            stats.selector_broken += 1
-            degraded = True
-            log.warning("Selector issue for %s: %s", label, result.error)
-            zoom_notes.save_diagnostics(page, f"selector-{note.metadata_id()}")
-        else:
-            index.add(
-                note_id,
-                title=note.title,
-                status=STATUS_RETRYABLE,
-                source_url=note.url,
-                host=note.host,
-                meeting_date=note.date,
-                aliases=aliases,
-                last_outcome="retryable",
-                last_error=result.error,
-            )
-            stats.retryable += 1
-            degraded = True
-            log.warning("Retryable download issue for %s: %s", label, result.error)
-
-    # Persist watermark so the next run can continue deeper into history.
-    top_ids = [n.metadata_id() for n in notes[:5]]
-    index.mark_scan(
-        last_run_at=datetime.now().isoformat(timespec="seconds"),
-        watermark_ids=last_processed_ids or top_ids,
-        last_top_ids=top_ids,
-        reached_end=reached_end and consecutive_known >= config.STOP_AFTER_KNOWN,
-        last_scanned_count=stats.scanned,
-        last_downloaded=stats.downloaded,
-    )
-    return EXIT_DEGRADED if degraded else EXIT_OK
-
-
-def ensure_authenticated(session: procs.BrowserSession) -> procs.BrowserSession:
-    """Ensure session is authenticated. May stop and replace the session."""
-    page = session.page
-    page.goto(config.NOTES_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(3000)
-    if zoom_notes.is_logged_in(page):
-        return session
-
-    log.warning("Session expired or missing. Launching interactive login...")
-    session.stop()
-
-    if not login_module.interactive_login():
-        raise RuntimeError("Interactive login failed or timed out.")
-
-    run_token = f"zoom-sync-{uuid.uuid4().hex}"
-    session = procs.BrowserSession(
-        headless=config.HEADLESS,
-        run_token=run_token,
-        process_names=config.browser_process_names(),
-        launch_kwargs=config.launch_kwargs(headless=config.HEADLESS),
-        new_context_fn=config.new_context,
-        use_saved_state=True,
-    )
-    session.start()
-    page = session.page
-    page.goto(config.NOTES_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(3000)
-    if not zoom_notes.is_logged_in(page):
-        raise RuntimeError("Still not authenticated after interactive login.")
-    return session
-
-
-def run_browser_phase(lock: lockfile.LockHandle | None = None) -> int:
-    """Browser + index work. Used in-process or as an isolated worker child."""
-    stats = RunStats()
-    code = EXIT_OK
-    session = None
-
-    try:
-        index = IndexStore.load(config.INDEX_FILE, backoff_hours=config.absent_backoff_hours())
-    except IndexCorruptError as exc:
-        log.error("%s", exc)
-        return EXIT_HARD
-
-    missing = index.reconcile_files(config.BASE_DIR)
-    if missing:
-        log.warning("Reconcile: %d downloaded record(s) missing files; will retry.", len(missing))
-
-    requeued = index.requeue_false_absents()
-    if requeued:
-        log.info(
-            "Re-queued %d note(s) previously marked no-transcript (likely menu/UI miss).",
-            requeued,
-        )
-
-    orphans = index.find_orphan_files(config.TRANSCRIPTS_DIR, config.BASE_DIR)
-    stats.orphans = len(orphans)
-    if orphans:
-        preview = ", ".join(orphans[:5])
-        more = f" (+{len(orphans) - 5} more)" if len(orphans) > 5 else ""
-        log.warning("Orphan transcript file(s) not in index: %s%s", preview, more)
-
-    try:
-        run_token = f"zoom-sync-{uuid.uuid4().hex}"
-        session = procs.BrowserSession(
-            headless=config.HEADLESS,
-            run_token=run_token,
-            process_names=config.browser_process_names(),
-            launch_kwargs=config.launch_kwargs(headless=config.HEADLESS),
-            new_context_fn=config.new_context,
-            use_saved_state=True,
-        )
-        session.start()
-        session = ensure_authenticated(session)
-        code = process_notes(session.page, index, lock, stats)
-
-        try:
-            if session.context is not None:
-                config.save_storage_state(session.context)
-                log.info("Session state refreshed.")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Could not refresh storage state: %s", exc)
-
-    except Exception as exc:  # noqa: BLE001
-        log.exception("Sync failed: %s", exc)
-        code = EXIT_HARD
-    finally:
-        if session is not None:
-            try:
-                session.stop()
-            except Exception:
-                pass
-        try:
-            idx_count = IndexStore.load(config.INDEX_FILE).count if config.INDEX_FILE.exists() else 0
-        except Exception:
-            idx_count = -1
-        log.info("Run summary: %s", stats.summary(idx_count, code))
-        _touch_sync_stamp(code, stats)
-
-    return code
-
-
-def _touch_sync_stamp(code: int, stats: RunStats) -> None:
-    """Write a root-level stamp so IDE/OpenCode file trees notice external writes.
-
-    data/ is gitignored and often poorly watched; a small root file change is a
-    reliable FS event for UIs that cache the tree until restart.
-    """
-    try:
-        stamp = config.BASE_DIR / ".last-sync"
-        stamp.write_text(
-            f"{datetime.now().isoformat(timespec='seconds')} exit={code} "
-            f"downloaded={stats.downloaded} scanned={stats.scanned}\\n",
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
-
-
-def _run_isolated_worker(lock: lockfile.LockHandle) -> int:
-    """Spawn a child process for Playwright work; kill the tree on timeout."""
-    cmd = [sys.executable, str(Path(__file__).resolve()), "--worker"]
-    log.info("Starting isolated browser worker: %s", " ".join(cmd))
-    creationflags = 0
-    if os.name == "nt":
-        # New process group so we can kill the tree.
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-
-    env = os.environ.copy()
-    env["ZOOM_SYNC_WORKER"] = "1"
-    # Child must not re-enter isolation.
-    env["ZOOM_WORKER_ISOLATION"] = "0"
-
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(config.BASE_DIR),
-        env=env,
-        creationflags=creationflags,
-    )
-    deadline = time.time() + config.WORKER_TIMEOUT_SECONDS
-    try:
-        while True:
-            try:
-                lock.heartbeat()
-            except Exception:
-                pass
-            rc = proc.poll()
-            if rc is not None:
-                log.info("Browser worker exited with code %s", rc)
-                return int(rc)
-            if time.time() >= deadline:
-                log.error(
-                    "Browser worker timed out after %ss; killing process tree.",
-                    config.WORKER_TIMEOUT_SECONDS,
-                )
-                procs.kill_process_tree(proc.pid)
-                try:
-                    proc.wait(timeout=15)
-                except Exception:
-                    pass
-                return EXIT_HARD
-            time.sleep(2)
-    except Exception:
-        procs.kill_process_tree(proc.pid)
-        raise
-
-
-def run(*, worker: bool = False) -> int:
-    setup_logging()
-    log.info("=== Zoom notes sync starting%s ===", " (worker)" if worker else "")
-
-    try:
-        config.validate_config()
-        config.ensure_dirs()
-        config.prune_old_logs()
-        if config.APPLY_ACLS:
-            acl_paths = [
-                config.STORAGE_STATE,
-                config.DATA_DIR,
-                config.LOGS_DIR,
-                config.DIAGNOSTICS_DIR,
-            ]
-            # Do not lock down an external vault/share (e.g. Obsidian under OneDrive).
-            try:
-                config.TRANSCRIPTS_DIR.resolve().relative_to(config.DATA_DIR.resolve())
-                acl_paths.append(config.TRANSCRIPTS_DIR)
-            except ValueError:
-                pass
-            security.apply_user_only_acls(acl_paths)
-    except ValueError as exc:
-        log.error("Configuration error: %s", exc)
-        return EXIT_HARD
-
-    # Worker child: parent already holds the lock.
-    if worker:
-        code = run_browser_phase(lock=None)
-        log.info("=== Zoom notes sync finished (exit %d) ===", code)
-        return code
-
-    lock = lockfile.acquire(config.LOCK_FILE, stale_minutes=config.LOCK_STALE_MINUTES)
-    if lock is None:
-        log.warning("Another healthy run holds the lock; exiting.")
-        return EXIT_LOCKED
-
-    code = EXIT_OK
-    try:
-        if config.WORKER_ISOLATION:
-            code = _run_isolated_worker(lock)
-        else:
-            code = run_browser_phase(lock)
-    except Exception as exc:  # noqa: BLE001
-        log.exception("Sync failed: %s", exc)
-        code = EXIT_HARD
-    finally:
-        lock.release()
-        log.info("=== Zoom notes sync finished (exit %d) ===", code)
-
-    return code
-
-
-if __name__ == "__main__":
-    is_worker = "--worker" in sys.argv[1:]
-    sys.exit(run(worker=is_worker))
+  "sync.py": `"""Scheduled sync entry point.\r
+\r
+Run every 30 minutes (via Task Scheduler / run.ps1). Loads the saved session,\r
+scans Zoom notes, downloads transcripts not already in the index, and records\r
+results. Expired sessions trigger interactive re-login in a separate browser\r
+lifecycle, then a fresh sync session continues.\r
+\r
+By default Playwright work runs in an isolated child process so hung Edge\r
+teardown cannot pin the lock forever.\r
+\r
+Exit codes:\r
+  0 success\r
+  1 hard failure\r
+  2 degraded (partial failures / selector issues)\r
+  3 skipped (lock held by healthy peer)\r
+\r
+    python sync.py\r
+    python sync.py --worker   # internal: browser phase only (no lock)\r
+"""\r
+\r
+from __future__ import annotations\r
+\r
+import logging\r
+import os\r
+import re\r
+import subprocess\r
+import sys\r
+import time\r
+import uuid\r
+from dataclasses import dataclass\r
+from datetime import datetime\r
+from pathlib import Path\r
+\r
+import config\r
+import lockfile\r
+import login as login_module\r
+import procs\r
+import security\r
+import zoom_notes\r
+from index_store import (\r
+    CONTENT_VERSION,\r
+    STATUS_DOWNLOADED,\r
+    STATUS_NO_TRANSCRIPT,\r
+    STATUS_RETRYABLE,\r
+    IndexCorruptError,\r
+    IndexStore,\r
+)\r
+from zoom_notes import DownloadOutcome, OpenMismatchError\r
+\r
+log = logging.getLogger("zoom_sync")\r
+\r
+EXIT_OK = 0\r
+EXIT_HARD = 1\r
+EXIT_DEGRADED = 2\r
+EXIT_LOCKED = 3\r
+\r
+\r
+@dataclass\r
+class RunStats:\r
+    scanned: int = 0\r
+    opened: int = 0\r
+    downloaded: int = 0\r
+    transcripts: int = 0\r
+    absent: int = 0\r
+    retryable: int = 0\r
+    failed: int = 0\r
+    skipped_known: int = 0\r
+    selector_broken: int = 0\r
+    orphans: int = 0\r
+\r
+    def summary(self, index_size: int, code: int) -> str:\r
+        return (\r
+            f"scanned={self.scanned} opened={self.opened} downloaded={self.downloaded} "\r
+            f"transcripts={self.transcripts} "\r
+            f"absent={self.absent} retryable={self.retryable} selector_broken={self.selector_broken} "\r
+            f"failed={self.failed} skipped_known={self.skipped_known} orphans={self.orphans} "\r
+            f"index={index_size} exit={code}"\r
+        )\r
+\r
+\r
+def setup_logging() -> None:\r
+    config.ensure_dirs()\r
+    logfile = config.LOGS_DIR / f"sync-{datetime.now():%Y%m%d}.log"\r
+    handlers = [logging.FileHandler(logfile, encoding="utf-8"), logging.StreamHandler(sys.stdout)]\r
+    logging.basicConfig(\r
+        level=logging.INFO,\r
+        format="%(asctime)s %(levelname)s %(message)s",\r
+        handlers=handlers,\r
+        force=True,\r
+    )\r
+\r
+\r
+_MONTH_ABBR = {\r
+    "jan": 1,\r
+    "feb": 2,\r
+    "mar": 3,\r
+    "apr": 4,\r
+    "may": 5,\r
+    "jun": 6,\r
+    "jul": 7,\r
+    "aug": 8,\r
+    "sep": 9,\r
+    "oct": 10,\r
+    "nov": 11,\r
+    "dec": 12,\r
+}\r
+\r
+\r
+def _parse_meeting_date(\r
+    note: zoom_notes.NoteRef, *, today: datetime | None = None\r
+) -> datetime:\r
+    """Best-effort calendar day for path/filename (date part only; time ignored).\r
+\r
+    Prefer ISO yyyy-mm-dd in the title (Zoom often embeds it), then the list-row\r
+    date text (e.g. 'Monday Jul 20, 13:58-14:51'), else today.\r
+    """\r
+    now = (today or datetime.now()).date()\r
+    for text in (note.title or "", note.date or ""):\r
+        m = re.search(r"(20\\d{2})-(\\d{2})-(\\d{2})", text)\r
+        if m:\r
+            try:\r
+                return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))\r
+            except ValueError:\r
+                pass\r
+\r
+    raw = note.date or ""\r
+    m = re.search(\r
+        r"\\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\\s+"\r
+        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\\s+"\r
+        r"(\\d{1,2})\\b",\r
+        raw,\r
+        re.IGNORECASE,\r
+    )\r
+    if m:\r
+        month = _MONTH_ABBR[m.group(1)[:3].lower()]\r
+        day = int(m.group(2))\r
+        year = now.year\r
+        try:\r
+            candidate = datetime(year, month, day).date()\r
+        except ValueError:\r
+            candidate = None\r
+        if candidate is not None:\r
+            # UI omits year; if the day is far in the future, it was last year.\r
+            if (candidate - now).days > 180:\r
+                try:\r
+                    candidate = datetime(year - 1, month, day).date()\r
+                except ValueError:\r
+                    candidate = None\r
+            if candidate is not None:\r
+                return datetime(candidate.year, candidate.month, candidate.day)\r
+\r
+    m = re.search(\r
+        r"\\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"\r
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|"\r
+        r"Dec(?:ember)?)\\s+(\\d{1,2})(?:st|nd|rd|th)?"\r
+        r"(?:,?\\s*)?(20\\d{2})?\\b",\r
+        note.title or "",\r
+        re.IGNORECASE,\r
+    )\r
+    if m:\r
+        month = _MONTH_ABBR[m.group(1)[:3].lower()]\r
+        day = int(m.group(2))\r
+        year = int(m.group(3)) if m.group(3) else now.year\r
+        try:\r
+            return datetime(year, month, day)\r
+        except ValueError:\r
+            pass\r
+\r
+    return datetime(now.year, now.month, now.day)\r
+\r
+\r
+def _safe_name(note: zoom_notes.NoteRef, meeting_day: datetime | None = None) -> str:\r
+    day = meeting_day or _parse_meeting_date(note)\r
+    prefix = f"{day:%Y-%m-%d}"\r
+    note_id = note.stable_id()\r
+    if config.PRIVACY_FILENAMES:\r
+        return f"{prefix}-{note_id}.md"\r
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", note.title).strip("_")[:80] or "note"\r
+    return f"{prefix}-{slug}__{note_id}.md"\r
+\r
+\r
+def _transcript_dest(note: zoom_notes.NoteRef) -> Path:\r
+    """Month folder under TRANSCRIPTS_DIR: {yyyy-mm}/{yyyy-mm-dd}-{name}.md"""\r
+    day = _parse_meeting_date(note)\r
+    return config.TRANSCRIPTS_DIR / f"{day:%Y-%m}" / _safe_name(note, day)\r
+\r
+\r
+def _note_ids(note: zoom_notes.NoteRef) -> list[str]:\r
+    ids = [note.metadata_id()]\r
+    if note.note_id:\r
+        ids.append(note.note_id)\r
+    sid = note.stable_id()\r
+    if sid not in ids:\r
+        ids.append(sid)\r
+    return ids\r
+\r
+\r
+def _is_due(note: zoom_notes.NoteRef, index: IndexStore) -> bool:\r
+    return any(index.should_process(i) for i in _note_ids(note))\r
+\r
+\r
+def _order_notes_for_processing(\r
+    notes: list[zoom_notes.NoteRef], index: IndexStore\r
+) -> list[zoom_notes.NoteRef]:\r
+    """Process every due note first (newest-first), then optional backfill candidates.\r
+\r
+    Never bury new top-of-list notes behind known ones \u2014 that interacted badly with\r
+    STOP_AFTER_KNOWN and skipped fresh meetings.\r
+    """\r
+    due: list[zoom_notes.NoteRef] = []\r
+    known: list[zoom_notes.NoteRef] = []\r
+    for note in notes:\r
+        if _is_due(note, index):\r
+            due.append(note)\r
+        else:\r
+            known.append(note)\r
+\r
+    # Among known-only tail, optionally rotate from watermark for future backfill\r
+    # discovery logging; we do not open known notes unless should_process says so.\r
+    marks = set(index.watermark_ids())\r
+    if marks and known:\r
+        cut = None\r
+        for i, note in enumerate(known):\r
+            if note.metadata_id() in marks or note.stable_id() in marks:\r
+                cut = i\r
+                break\r
+        if cut is not None and cut > 0:\r
+            known = known[cut:] + known[:cut]\r
+    return due + known\r
+\r
+\r
+def process_notes(page, index: IndexStore, lock: lockfile.LockHandle | None, stats: RunStats) -> int:\r
+    """Scan and download. Returns EXIT_OK or EXIT_DEGRADED."""\r
+    notes = zoom_notes.collect_notes(page, config.MAX_ITEMS, config.MAX_SCROLL_STEPS)\r
+    notes = _order_notes_for_processing(notes, index)\r
+    stats.scanned = len(notes)\r
+    due_count = sum(1 for n in notes if _is_due(n, index))\r
+    log.info("Found %d note(s) after scan/scroll (%d due).", len(notes), due_count)\r
+    if not notes:\r
+        if zoom_notes.is_logged_in(page):\r
+            log.warning(\r
+                "No meeting notes parsed while authenticated. "\r
+                "Selectors may need updating (see zoom_notes.SELECTORS)."\r
+            )\r
+            zoom_notes.save_diagnostics(page, f"empty-list-{datetime.now():%H%M%S}")\r
+            return EXIT_DEGRADED\r
+        log.error("Not authenticated and no notes found.")\r
+        return EXIT_HARD\r
+\r
+    consecutive_known = 0\r
+    work_budget = config.MAX_ITEMS\r
+    degraded = False\r
+    last_processed_ids: list[str] = []\r
+    reached_end = True\r
+    due_remaining = due_count\r
+\r
+    for note in notes:\r
+        if work_budget <= 0:\r
+            log.info("Work budget (%d) exhausted; remaining notes deferred.", config.MAX_ITEMS)\r
+            reached_end = False\r
+            break\r
+\r
+        if lock is not None:\r
+            try:\r
+                lock.heartbeat()\r
+            except Exception:\r
+                pass\r
+\r
+        pre_ids = _note_ids(note)\r
+        if not _is_due(note, index):\r
+            consecutive_known += 1\r
+            stats.skipped_known += 1\r
+            last_processed_ids = pre_ids[:3]\r
+            # Only stop early when no due notes remain later in the queue.\r
+            if due_remaining <= 0 and consecutive_known >= config.STOP_AFTER_KNOWN:\r
+                log.info("Hit %d consecutive known notes; stopping scan.", consecutive_known)\r
+                break\r
+            continue\r
+\r
+        due_remaining = max(0, due_remaining - 1)\r
+        label = config.note_label(note.metadata_id(), note.title)\r
+        log.info("Processing due note %s", label)\r
+        try:\r
+            zoom_notes.open_note(page, note)\r
+        except OpenMismatchError as exc:\r
+            log.error("Open mismatch for %s: %s", label, exc)\r
+            stats.failed += 1\r
+            degraded = True\r
+            consecutive_known = 0\r
+            work_budget -= 1\r
+            zoom_notes._dismiss_menu(page)\r
+            zoom_notes.save_diagnostics(page, f"mismatch-{note.metadata_id()}")\r
+            index.add(\r
+                note.metadata_id(),\r
+                title=note.title,\r
+                status=STATUS_RETRYABLE,\r
+                host=note.host,\r
+                meeting_date=note.date,\r
+                last_outcome="open_mismatch",\r
+                last_error=str(exc)[:300],\r
+            )\r
+            continue\r
+        except Exception as exc:  # noqa: BLE001\r
+            log.error("Failed to open note %s: %s", label, exc)\r
+            stats.failed += 1\r
+            degraded = True\r
+            consecutive_known = 0\r
+            work_budget -= 1\r
+            zoom_notes._dismiss_menu(page)\r
+            index.add(\r
+                note.metadata_id(),\r
+                title=note.title,\r
+                status=STATUS_RETRYABLE,\r
+                host=note.host,\r
+                meeting_date=note.date,\r
+                last_outcome="open_error",\r
+                last_error=str(exc)[:300],\r
+            )\r
+            continue\r
+\r
+        stats.opened += 1\r
+        work_budget -= 1\r
+        note_id = note.stable_id()\r
+        meta_id = note.metadata_id()\r
+        aliases = [a for a in _note_ids(note) if a != note_id]\r
+        last_processed_ids = _note_ids(note)[:3]\r
+\r
+        if not index.should_process(note_id) and not index.should_process(meta_id):\r
+            log.info("Already have %s (resolved). Skipping.", label)\r
+            consecutive_known += 1\r
+            stats.skipped_known += 1\r
+            if consecutive_known >= config.STOP_AFTER_KNOWN:\r
+                break\r
+            continue\r
+\r
+        consecutive_known = 0\r
+        dest = _transcript_dest(note)\r
+        try:\r
+            result = zoom_notes.download_transcript(page, dest)\r
+        except Exception as exc:  # noqa: BLE001\r
+            log.error("Download error for %s: %s", label, exc)\r
+            stats.failed += 1\r
+            degraded = True\r
+            index.add(\r
+                note_id,\r
+                title=note.title,\r
+                status=STATUS_RETRYABLE,\r
+                source_url=note.url,\r
+                host=note.host,\r
+                meeting_date=note.date,\r
+                aliases=aliases,\r
+                last_outcome="error",\r
+                last_error=str(exc)[:300],\r
+            )\r
+            continue\r
+\r
+        if result.outcome == DownloadOutcome.DOWNLOADED:\r
+            try:\r
+                rel = str(dest.relative_to(config.BASE_DIR))\r
+            except ValueError:\r
+                rel = str(dest)\r
+            index.add(\r
+                note_id,\r
+                title=note.title,\r
+                status=STATUS_DOWNLOADED,\r
+                source_url=note.url,\r
+                host=note.host,\r
+                meeting_date=note.date,\r
+                file=rel,\r
+                aliases=aliases,\r
+                size=result.size,\r
+                sha256=result.sha256,\r
+                last_outcome="downloaded",\r
+                content_version=CONTENT_VERSION,\r
+                has_transcript=result.has_transcript,\r
+            )\r
+            stats.downloaded += 1\r
+            if result.has_transcript:\r
+                stats.transcripts += 1\r
+            try:\r
+                shown = str(dest.relative_to(config.TRANSCRIPTS_DIR))\r
+            except ValueError:\r
+                shown = str(dest)\r
+            log.info(\r
+                "Saved note content%s: %s -> %s",\r
+                " + transcript" if result.has_transcript else "",\r
+                label,\r
+                shown,\r
+            )\r
+        elif result.outcome == DownloadOutcome.ABSENT:\r
+            index.add(\r
+                note_id,\r
+                title=note.title,\r
+                status=STATUS_NO_TRANSCRIPT,\r
+                source_url=note.url,\r
+                host=note.host,\r
+                meeting_date=note.date,\r
+                aliases=aliases,\r
+                last_outcome="absent",\r
+                last_error=result.error,\r
+            )\r
+            stats.absent += 1\r
+            log.info(\r
+                "No transcript for %s; backoff scheduled. (%s)",\r
+                label,\r
+                (result.error or "")[:200],\r
+            )\r
+        elif result.outcome == DownloadOutcome.SELECTOR_BROKEN:\r
+            index.add(\r
+                note_id,\r
+                title=note.title,\r
+                status=STATUS_RETRYABLE,\r
+                source_url=note.url,\r
+                host=note.host,\r
+                meeting_date=note.date,\r
+                aliases=aliases,\r
+                last_outcome="selector_broken",\r
+                last_error=result.error,\r
+            )\r
+            stats.selector_broken += 1\r
+            degraded = True\r
+            log.warning("Selector issue for %s: %s", label, result.error)\r
+            zoom_notes.save_diagnostics(page, f"selector-{note.metadata_id()}")\r
+        else:\r
+            index.add(\r
+                note_id,\r
+                title=note.title,\r
+                status=STATUS_RETRYABLE,\r
+                source_url=note.url,\r
+                host=note.host,\r
+                meeting_date=note.date,\r
+                aliases=aliases,\r
+                last_outcome="retryable",\r
+                last_error=result.error,\r
+            )\r
+            stats.retryable += 1\r
+            degraded = True\r
+            log.warning("Retryable download issue for %s: %s", label, result.error)\r
+\r
+    # Persist watermark so the next run can continue deeper into history.\r
+    top_ids = [n.metadata_id() for n in notes[:5]]\r
+    index.mark_scan(\r
+        last_run_at=datetime.now().isoformat(timespec="seconds"),\r
+        watermark_ids=last_processed_ids or top_ids,\r
+        last_top_ids=top_ids,\r
+        reached_end=reached_end and consecutive_known >= config.STOP_AFTER_KNOWN,\r
+        last_scanned_count=stats.scanned,\r
+        last_downloaded=stats.downloaded,\r
+    )\r
+    return EXIT_DEGRADED if degraded else EXIT_OK\r
+\r
+\r
+def ensure_authenticated(session: procs.BrowserSession) -> procs.BrowserSession:\r
+    """Ensure session is authenticated. May stop and replace the session."""\r
+    page = session.page\r
+    page.goto(config.NOTES_URL, wait_until="domcontentloaded")\r
+    page.wait_for_timeout(3000)\r
+    if zoom_notes.is_logged_in(page):\r
+        return session\r
+\r
+    log.warning("Session expired or missing. Launching interactive login...")\r
+    session.stop()\r
+\r
+    if not login_module.interactive_login():\r
+        raise RuntimeError("Interactive login failed or timed out.")\r
+\r
+    run_token = f"zoom-sync-{uuid.uuid4().hex}"\r
+    session = procs.BrowserSession(\r
+        headless=config.HEADLESS,\r
+        run_token=run_token,\r
+        process_names=config.browser_process_names(),\r
+        launch_kwargs=config.launch_kwargs(headless=config.HEADLESS),\r
+        new_context_fn=config.new_context,\r
+        use_saved_state=True,\r
+    )\r
+    session.start()\r
+    page = session.page\r
+    page.goto(config.NOTES_URL, wait_until="domcontentloaded")\r
+    page.wait_for_timeout(3000)\r
+    if not zoom_notes.is_logged_in(page):\r
+        raise RuntimeError("Still not authenticated after interactive login.")\r
+    return session\r
+\r
+\r
+def run_browser_phase(lock: lockfile.LockHandle | None = None) -> int:\r
+    """Browser + index work. Used in-process or as an isolated worker child."""\r
+    stats = RunStats()\r
+    code = EXIT_OK\r
+    session = None\r
+\r
+    try:\r
+        index = IndexStore.load(config.INDEX_FILE, backoff_hours=config.absent_backoff_hours())\r
+    except IndexCorruptError as exc:\r
+        log.error("%s", exc)\r
+        return EXIT_HARD\r
+\r
+    missing = index.reconcile_files(config.BASE_DIR)\r
+    if missing:\r
+        log.warning("Reconcile: %d downloaded record(s) missing files; will retry.", len(missing))\r
+\r
+    requeued = index.requeue_false_absents()\r
+    if requeued:\r
+        log.info(\r
+            "Re-queued %d note(s) previously marked no-transcript (likely menu/UI miss).",\r
+            requeued,\r
+        )\r
+\r
+    backfill = index.requeue_pre_transcript()\r
+    if backfill:\r
+        log.info(\r
+            "Re-queued %d already-downloaded note(s) to append the raw transcript.",\r
+            backfill,\r
+        )\r
+\r
+    orphans = index.find_orphan_files(config.TRANSCRIPTS_DIR, config.BASE_DIR)\r
+    stats.orphans = len(orphans)\r
+    if orphans:\r
+        preview = ", ".join(orphans[:5])\r
+        more = f" (+{len(orphans) - 5} more)" if len(orphans) > 5 else ""\r
+        log.warning("Orphan transcript file(s) not in index: %s%s", preview, more)\r
+\r
+    try:\r
+        run_token = f"zoom-sync-{uuid.uuid4().hex}"\r
+        session = procs.BrowserSession(\r
+            headless=config.HEADLESS,\r
+            run_token=run_token,\r
+            process_names=config.browser_process_names(),\r
+            launch_kwargs=config.launch_kwargs(headless=config.HEADLESS),\r
+            new_context_fn=config.new_context,\r
+            use_saved_state=True,\r
+        )\r
+        session.start()\r
+        session = ensure_authenticated(session)\r
+        code = process_notes(session.page, index, lock, stats)\r
+\r
+        try:\r
+            if session.context is not None:\r
+                config.save_storage_state(session.context)\r
+                log.info("Session state refreshed.")\r
+        except Exception as exc:  # noqa: BLE001\r
+            log.warning("Could not refresh storage state: %s", exc)\r
+\r
+    except Exception as exc:  # noqa: BLE001\r
+        log.exception("Sync failed: %s", exc)\r
+        code = EXIT_HARD\r
+    finally:\r
+        if session is not None:\r
+            try:\r
+                session.stop()\r
+            except Exception:\r
+                pass\r
+        try:\r
+            idx_count = IndexStore.load(config.INDEX_FILE).count if config.INDEX_FILE.exists() else 0\r
+        except Exception:\r
+            idx_count = -1\r
+        log.info("Run summary: %s", stats.summary(idx_count, code))\r
+        _touch_sync_stamp(code, stats)\r
+\r
+    return code\r
+\r
+\r
+def _touch_sync_stamp(code: int, stats: RunStats) -> None:\r
+    """Write a root-level stamp so IDE/OpenCode file trees notice external writes.\r
+\r
+    data/ is gitignored and often poorly watched; a small root file change is a\r
+    reliable FS event for UIs that cache the tree until restart.\r
+    """\r
+    try:\r
+        stamp = config.BASE_DIR / ".last-sync"\r
+        stamp.write_text(\r
+            f"{datetime.now().isoformat(timespec='seconds')} exit={code} "\r
+            f"downloaded={stats.downloaded} scanned={stats.scanned}\\n",\r
+            encoding="utf-8",\r
+        )\r
+    except OSError:\r
+        pass\r
+\r
+\r
+def _run_isolated_worker(lock: lockfile.LockHandle) -> int:\r
+    """Spawn a child process for Playwright work; kill the tree on timeout."""\r
+    cmd = [sys.executable, str(Path(__file__).resolve()), "--worker"]\r
+    log.info("Starting isolated browser worker: %s", " ".join(cmd))\r
+    creationflags = 0\r
+    if os.name == "nt":\r
+        # New process group so we can kill the tree.\r
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)\r
+\r
+    env = os.environ.copy()\r
+    env["ZOOM_SYNC_WORKER"] = "1"\r
+    # Child must not re-enter isolation.\r
+    env["ZOOM_WORKER_ISOLATION"] = "0"\r
+\r
+    proc = subprocess.Popen(\r
+        cmd,\r
+        cwd=str(config.BASE_DIR),\r
+        env=env,\r
+        creationflags=creationflags,\r
+    )\r
+    deadline = time.time() + config.WORKER_TIMEOUT_SECONDS\r
+    try:\r
+        while True:\r
+            try:\r
+                lock.heartbeat()\r
+            except Exception:\r
+                pass\r
+            rc = proc.poll()\r
+            if rc is not None:\r
+                log.info("Browser worker exited with code %s", rc)\r
+                return int(rc)\r
+            if time.time() >= deadline:\r
+                log.error(\r
+                    "Browser worker timed out after %ss; killing process tree.",\r
+                    config.WORKER_TIMEOUT_SECONDS,\r
+                )\r
+                procs.kill_process_tree(proc.pid)\r
+                try:\r
+                    proc.wait(timeout=15)\r
+                except Exception:\r
+                    pass\r
+                return EXIT_HARD\r
+            time.sleep(2)\r
+    except Exception:\r
+        procs.kill_process_tree(proc.pid)\r
+        raise\r
+\r
+\r
+def run(*, worker: bool = False) -> int:\r
+    setup_logging()\r
+    log.info("=== Zoom notes sync starting%s ===", " (worker)" if worker else "")\r
+\r
+    try:\r
+        config.validate_config()\r
+        config.ensure_dirs()\r
+        config.prune_old_logs()\r
+        if config.APPLY_ACLS:\r
+            acl_paths = [\r
+                config.STORAGE_STATE,\r
+                config.DATA_DIR,\r
+                config.LOGS_DIR,\r
+                config.DIAGNOSTICS_DIR,\r
+            ]\r
+            # Do not lock down an external vault/share (e.g. Obsidian under OneDrive).\r
+            try:\r
+                config.TRANSCRIPTS_DIR.resolve().relative_to(config.DATA_DIR.resolve())\r
+                acl_paths.append(config.TRANSCRIPTS_DIR)\r
+            except ValueError:\r
+                pass\r
+            security.apply_user_only_acls(acl_paths)\r
+    except ValueError as exc:\r
+        log.error("Configuration error: %s", exc)\r
+        return EXIT_HARD\r
+\r
+    # Worker child: parent already holds the lock.\r
+    if worker:\r
+        code = run_browser_phase(lock=None)\r
+        log.info("=== Zoom notes sync finished (exit %d) ===", code)\r
+        return code\r
+\r
+    lock = lockfile.acquire(config.LOCK_FILE, stale_minutes=config.LOCK_STALE_MINUTES)\r
+    if lock is None:\r
+        log.warning("Another healthy run holds the lock; exiting.")\r
+        return EXIT_LOCKED\r
+\r
+    code = EXIT_OK\r
+    try:\r
+        if config.WORKER_ISOLATION:\r
+            code = _run_isolated_worker(lock)\r
+        else:\r
+            code = run_browser_phase(lock)\r
+    except Exception as exc:  # noqa: BLE001\r
+        log.exception("Sync failed: %s", exc)\r
+        code = EXIT_HARD\r
+    finally:\r
+        lock.release()\r
+        log.info("=== Zoom notes sync finished (exit %d) ===", code)\r
+\r
+    return code\r
+\r
+\r
+if __name__ == "__main__":\r
+    is_worker = "--worker" in sys.argv[1:]\r
+    sys.exit(run(worker=is_worker))\r
 `,
-  "login.py": '"""Interactive login for Zoom Notes.\n\nRun this once (or whenever the session expires) to open a real browser window,\nlog in manually, and persist the authenticated session to `storage_state.json`.\n\n    python login.py\n\nIt is also imported by `sync.py` to drive the auto re-auth flow when a\nscheduled run detects an expired session.\n"""\n\nfrom __future__ import annotations\n\nimport sys\nimport time\nimport uuid\n\nfrom playwright.sync_api import Error as PWError\n\nimport config\nimport procs\nimport zoom_notes\n\n\ndef _logged_in_page(context):\n    """Return the first open page/tab that looks authenticated, else None."""\n    for pg in list(context.pages):\n        try:\n            if zoom_notes.is_logged_in(pg):\n                return pg\n        except PWError:\n            continue\n    return None\n\n\ndef interactive_login(wait_seconds: int = None) -> bool:\n    """Open a visible browser, let the user sign in, and save the session.\n\n    Returns True if login succeeded and the session was saved. Owns its browser\n    lifecycle completely; callers must not hold another Playwright Edge session\n    open while this runs.\n    """\n    wait_seconds = wait_seconds if wait_seconds is not None else config.LOGIN_WAIT_SECONDS\n    config.ensure_dirs()\n    config.validate_config()\n\n    run_token = f"zoom-login-{uuid.uuid4().hex}"\n    session = procs.BrowserSession(\n        headless=False,\n        run_token=run_token,\n        process_names=config.browser_process_names(),\n        launch_kwargs=config.launch_kwargs(headless=False),\n        new_context_fn=config.new_context,\n        use_saved_state=True,\n    )\n\n    try:\n        session.start()\n        context = session.context\n        page = session.page\n\n        print(f"Opening {config.redact_url(config.NOTES_URL)} ...", flush=True)\n        try:\n            page.goto(config.NOTES_URL, wait_until="domcontentloaded")\n        except PWError as exc:\n            print(f"Initial navigation warning: {exc}", flush=True)\n\n        print("Please complete the sign-in in the browser window.", flush=True)\n        print(f"Waiting up to {wait_seconds}s for the notes list to appear...", flush=True)\n\n        # Let redirects settle before auth checks.\n        time.sleep(5)\n\n        deadline = time.time() + wait_seconds\n        authed_page = None\n        last_report = 0.0\n        while time.time() < deadline:\n            if not context.pages:\n                print("  [info] no tabs open; reopening notes page...", flush=True)\n                try:\n                    newp = context.new_page()\n                    newp.goto(config.NOTES_URL, wait_until="domcontentloaded")\n                except PWError as exc:\n                    print(f"  [info] reopen failed: {exc}", flush=True)\n                    time.sleep(2)\n                    continue\n\n            authed_page = _logged_in_page(context)\n            if authed_page is not None:\n                break\n\n            now = time.time()\n            if now - last_report > 10:\n                urls = []\n                for pg in list(context.pages):\n                    try:\n                        urls.append(config.redact_url(pg.url))\n                    except PWError:\n                        pass\n                print(f"  [waiting] open tabs: {urls}", flush=True)\n                last_report = now\n            time.sleep(2)\n\n        logged_in = authed_page is not None\n        if logged_in:\n            time.sleep(2)\n            try:\n                config.save_storage_state(context)\n                print(\n                    f"Login successful (url: {config.redact_url(authed_page.url)}). "\n                    f"Session saved to {config.STORAGE_STATE}",\n                    flush=True,\n                )\n            except PWError as exc:\n                logged_in = False\n                print(f"Session save failed: {exc}", flush=True)\n        else:\n            print("Timed out / no authenticated tab. Session NOT saved.", flush=True)\n\n        return logged_in\n    finally:\n        session.stop()\n\n\nif __name__ == "__main__":\n    try:\n        ok = interactive_login()\n    except Exception as exc:  # noqa: BLE001\n        print(f"Login failed: {exc}", flush=True)\n        ok = False\n    sys.exit(0 if ok else 1)\n',
-  "config.py": `"""Central configuration for the Zoom Notes transcript sync.
-
-All tunables live here so the rest of the code stays declarative. Paths are
-resolved relative to this file so the scripts work regardless of the current
-working directory (important when launched from Task Scheduler).
-"""
-
-from __future__ import annotations
-
-import os
-import re
-import sys
-from pathlib import Path
-from typing import List
-from urllib.parse import urlparse
-
-BASE_DIR = Path(__file__).resolve().parent
-
-# --- Target ---------------------------------------------------------------
-_DEFAULT_NOTES_URL = "https://docs.zoom.us/notes?from=client"
-NOTES_URL = os.environ.get("ZOOM_NOTES_URL", _DEFAULT_NOTES_URL)
-
-# Hostnames allowed for automated navigation (authenticated browser).
-_DEFAULT_ALLOWED_HOSTS = ("docs.zoom.us",)
-ALLOWED_HOSTS = tuple(
-    h.strip().lower()
-    for h in os.environ.get("ZOOM_ALLOWED_HOSTS", ",".join(_DEFAULT_ALLOWED_HOSTS)).split(",")
-    if h.strip()
-)
-
-# Substring that indicates we were bounced to a sign-in page (not logged in).
-SIGNIN_URL_MARKERS = ("/signin", "zoom.us/signin", "/oauth", "/saml")
-
-# --- Filesystem -----------------------------------------------------------
-STORAGE_STATE = BASE_DIR / "storage_state.json"
-DATA_DIR = Path(os.environ.get("ZOOM_DATA_DIR", str(BASE_DIR / "data")))
-# Transcript destination (may live outside the repo, e.g. an Obsidian vault).
-# Override with ZOOM_TRANSCRIPTS_DIR. Index/backoff stay under DATA_DIR.
-_DEFAULT_TRANSCRIPTS_DIR = str(BASE_DIR / "mynotes")
-TRANSCRIPTS_DIR = Path(
-    os.environ.get("ZOOM_TRANSCRIPTS_DIR", _DEFAULT_TRANSCRIPTS_DIR)
-)
-INDEX_FILE = DATA_DIR / "index.json"
-LOGS_DIR = Path(os.environ.get("ZOOM_LOGS_DIR", str(BASE_DIR / "logs")))
-DIAGNOSTICS_DIR = LOGS_DIR / "diagnostics"
-LOCK_FILE = BASE_DIR / "sync.lock"
-
-# --- Browser --------------------------------------------------------------
-# Use an installed, IT-approved browser instead of Playwright's bundled
-# Chromium (which may be blocked by security policy). Valid channels:
-# "msedge", "chrome", "chrome-beta", "msedge-beta", etc. Set to "" (empty)
-# to fall back to Playwright's bundled Chromium (requires \`playwright install\`).
-# Prefer real desktop browsers: Edge (Windows), Chrome (macOS), Chromium (Linux).
-if os.name == "nt":
-    _DEFAULT_CHANNEL = "msedge"
-elif sys.platform == "darwin":
-    _DEFAULT_CHANNEL = "chrome"
-else:
-    _DEFAULT_CHANNEL = ""
-# Empty env var must fall through to default (os.environ.get("", default) returns "").
-_raw_channel = os.environ.get("ZOOM_BROWSER_CHANNEL")
-BROWSER_CHANNEL = _DEFAULT_CHANNEL if _raw_channel is None or _raw_channel.strip() == "" else _raw_channel.strip()
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in ("1", "true", "t", "yes", "y", "on")
-
-
-def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        value = default
-    else:
-        try:
-            value = int(raw.strip())
-        except ValueError as exc:
-            raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
-    if minimum is not None and value < minimum:
-        raise ValueError(f"{name} must be >= {minimum}, got {value}")
-    if maximum is not None and value > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {value}")
-    return value
-
-
-def launch_kwargs(headless: bool) -> dict:
-    """Build chromium.launch kwargs, honoring the configured browser channel."""
-    kwargs: dict = {"headless": headless}
-    if BROWSER_CHANNEL:
-        kwargs["channel"] = BROWSER_CHANNEL
-    args = [
-        "--disable-dev-shm-usage",
-        "--no-default-browser-check",
-        "--disable-blink-features=AutomationControlled",
-    ]
-    # macOS: avoid background throttling that stalls Zoom\u2019s SPA in automation.
-    if sys.platform == "darwin":
-        args.extend(
-            [
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding",
-            ]
-        )
-    kwargs["args"] = args
-    return kwargs
-
-
-def new_context(browser, use_saved_state: bool = True):
-    """Create a non-persistent context, loading the saved session if present.
-
-    Non-persistent contexts use a throwaway profile, avoiding the profile-lock
-    problems that plague persistent contexts on Windows. The authenticated
-    session is carried via STORAGE_STATE instead.
-    """
-    # Note: downloads_path is only valid on launch_persistent_context, not new_context.
-    # File downloads are saved via page.expect_download() + download.save_as(...).
-    kwargs: dict = {
-        "accept_downloads": True,
-        "viewport": {"width": 1400, "height": 900},
-        "locale": "en-US",
-        # Required for Zoom "Copy page content" \u2192 clipboard workflow.
-        "permissions": ["clipboard-read", "clipboard-write"],
-    }
-    if use_saved_state and STORAGE_STATE.exists():
-        kwargs["storage_state"] = str(STORAGE_STATE)
-    ctx = browser.new_context(**kwargs)
-    ctx.set_default_navigation_timeout(NAV_TIMEOUT_MS)
-    ctx.set_default_timeout(ACTION_TIMEOUT_MS)
-    try:
-        ctx.grant_permissions(
-            ["clipboard-read", "clipboard-write"],
-            origin="https://docs.zoom.us",
-        )
-    except Exception:
-        pass
-    return ctx
-
-
-def save_storage_state(context) -> None:
-    """Atomically persist the browser storage state."""
-    STORAGE_STATE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STORAGE_STATE.with_suffix(STORAGE_STATE.suffix + ".tmp")
-    bak = STORAGE_STATE.with_suffix(STORAGE_STATE.suffix + ".bak")
-    context.storage_state(path=str(tmp))
-    if STORAGE_STATE.exists():
-        try:
-            if bak.exists():
-                bak.unlink()
-            STORAGE_STATE.replace(bak)
-        except OSError:
-            pass
-    tmp.replace(STORAGE_STATE)
-
-
-def validate_notes_url(url: str = None) -> str:
-    """Validate NOTES_URL is https and on an allowed Zoom host. Returns the URL."""
-    candidate = (url if url is not None else NOTES_URL).strip()
-    parsed = urlparse(candidate)
-    if parsed.scheme.lower() != "https":
-        raise ValueError(f"ZOOM_NOTES_URL must be https, got scheme={parsed.scheme!r}")
-    host = (parsed.hostname or "").lower()
-    if host not in ALLOWED_HOSTS:
-        raise ValueError(
-            f"ZOOM_NOTES_URL host {host!r} is not allowed; allowed={list(ALLOWED_HOSTS)}"
-        )
-    return candidate
-
-
-def browser_process_names() -> List[str]:
-    """Process image names used by the configured channel (for scoped cleanup)."""
-    channel = (BROWSER_CHANNEL or "").lower()
-    if os.name == "nt":
-        if channel.startswith("msedge"):
-            return ["msedge.exe"]
-        if channel.startswith("chrome"):
-            return ["chrome.exe"]
-        return ["chrome.exe", "chromium.exe"]
-    # macOS / Linux process names (for pgrep/pkill token cleanup)
-    if channel.startswith("msedge") or channel.startswith("edge"):
-        return ["Microsoft Edge", "msedge"]
-    if channel.startswith("chrome"):
-        return ["Google Chrome", "chrome"]
-    return ["Chromium", "chrome", "chromium"]
-
-
-# --- Behaviour ------------------------------------------------------------
-# Run headless during scheduled syncs. Re-auth temporarily forces a headed
-# window regardless of this value.
-HEADLESS = _env_bool("ZOOM_HEADLESS", True)
-
-# Max note open/download attempts per run (work budget, not visibility ceiling).
-MAX_ITEMS = _env_int("ZOOM_MAX_ITEMS", 25, minimum=1, maximum=500)
-
-# Stop scanning after this many consecutive already-known notes once the list
-# end has been reached (or scroll produces no new rows).
-STOP_AFTER_KNOWN = _env_int("ZOOM_STOP_AFTER_KNOWN", 3, minimum=1, maximum=100)
-
-# Max scroll steps while collecting/scanning the notes list.
-MAX_SCROLL_STEPS = _env_int("ZOOM_MAX_SCROLL_STEPS", 30, minimum=0, maximum=200)
-
-# Timeouts (milliseconds).
-NAV_TIMEOUT_MS = _env_int("ZOOM_NAV_TIMEOUT_MS", 45000, minimum=1000)
-ACTION_TIMEOUT_MS = _env_int("ZOOM_ACTION_TIMEOUT_MS", 20000, minimum=1000)
-DOWNLOAD_TIMEOUT_MS = _env_int("ZOOM_DOWNLOAD_TIMEOUT_MS", 60000, minimum=1000)
-
-# How long (seconds) to wait for the human to finish logging in during the
-# interactive re-auth flow.
-LOGIN_WAIT_SECONDS = _env_int("ZOOM_LOGIN_WAIT_SECONDS", 300, minimum=30, maximum=3600)
-
-# Treat a lock file older than this many minutes (by heartbeat) as stale.
-LOCK_STALE_MINUTES = _env_int("ZOOM_LOCK_STALE_MINUTES", 25, minimum=1, maximum=240)
-
-# Log retention and privacy.
-LOG_RETENTION_DAYS = _env_int("ZOOM_LOG_RETENTION_DAYS", 30, minimum=1, maximum=3650)
-LOG_TITLES = _env_bool("ZOOM_LOG_TITLES", False)
-APPLY_ACLS = _env_bool("ZOOM_APPLY_ACLS", True)
-# New downloads only: omit title from filename (date prefix + id only; existing untouched).
-PRIVACY_FILENAMES = _env_bool("ZOOM_PRIVACY_FILENAMES", False)
-# Require opened-note title to match before downloading (hard fail on clear mismatch).
-STRICT_OPEN_VERIFY = _env_bool("ZOOM_STRICT_OPEN_VERIFY", True)
-# Run Playwright work in a child process so hung Edge can be killed as a tree.
-WORKER_ISOLATION = _env_bool("ZOOM_WORKER_ISOLATION", True)
-# Max seconds the parent waits for the browser worker (includes login wait headroom).
-WORKER_TIMEOUT_SECONDS = _env_int("ZOOM_WORKER_TIMEOUT_SECONDS", 1200, minimum=60, maximum=7200)
-
-# Absent-transcript backoff schedule in hours (comma-separated).
-_DEFAULT_BACKOFF_HOURS = "6,24,72,168"
-
-
-def absent_backoff_hours() -> List[int]:
-    raw = os.environ.get("ZOOM_ABSENT_BACKOFF_HOURS", _DEFAULT_BACKOFF_HOURS)
-    hours: List[int] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        value = int(part)
-        if value < 1:
-            raise ValueError("ZOOM_ABSENT_BACKOFF_HOURS values must be >= 1")
-        hours.append(value)
-    if not hours:
-        hours = [6, 24, 72, 168]
-    return hours
-
-
-def ensure_dirs() -> None:
-    """Create the runtime directories if they don't exist yet."""
-    TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def redact_url(url: str) -> str:
-    """Strip query string and fragment from a URL for safe logging."""
-    if not url:
-        return ""
-    try:
-        parsed = urlparse(url)
-        host = parsed.netloc or ""
-        path = parsed.path or ""
-        return f"{parsed.scheme}://{host}{path}" if parsed.scheme else f"{host}{path}"
-    except Exception:
-        return re.sub(r"[?#].*$", "", url)
-
-
-def note_label(note_id: str, title: str = "") -> str:
-    """Human-readable log label; titles are opt-in via ZOOM_LOG_TITLES."""
-    if LOG_TITLES and title:
-        return f"{note_id} ({title})"
-    return note_id
-
-
-def validate_config() -> None:
-    """Validate configuration early; raise ValueError on bad values."""
-    validate_notes_url(NOTES_URL)
-    # Touch validated ints already parsed at import; re-check backoff.
-    absent_backoff_hours()
-    if not ALLOWED_HOSTS:
-        raise ValueError("ZOOM_ALLOWED_HOSTS must list at least one host")
-
-
-def prune_old_logs(directory: Path = None, retention_days: int = None) -> int:
-    """Delete dated log files older than retention. Returns number removed."""
-    import time
-
-    directory = directory or LOGS_DIR
-    retention_days = LOG_RETENTION_DAYS if retention_days is None else retention_days
-    if not directory.exists():
-        return 0
-    cutoff = time.time() - (retention_days * 86400)
-    removed = 0
-    patterns = ("sync-*.log", "run-*.log")
-    for pattern in patterns:
-        for path in directory.glob(pattern):
-            try:
-                if path.is_file() and path.stat().st_mtime < cutoff:
-                    path.unlink(missing_ok=True)
-                    removed += 1
-            except OSError:
-                continue
-    # Cap diagnostics to newest 20 files.
-    try:
-        diags = sorted(
-            DIAGNOSTICS_DIR.glob("*"),
-            key=lambda p: p.stat().st_mtime if p.exists() else 0,
-            reverse=True,
-        )
-        for stale in diags[20:]:
-            try:
-                stale.unlink(missing_ok=True)
-            except OSError:
-                pass
-    except OSError:
-        pass
-    return removed
+  "login.py": '"""Interactive login for Zoom Notes.\r\n\r\nRun this once (or whenever the session expires) to open a real browser window,\r\nlog in manually, and persist the authenticated session to `storage_state.json`.\r\n\r\n    python login.py\r\n\r\nIt is also imported by `sync.py` to drive the auto re-auth flow when a\r\nscheduled run detects an expired session.\r\n"""\r\n\r\nfrom __future__ import annotations\r\n\r\nimport sys\r\nimport time\r\nimport uuid\r\n\r\nfrom playwright.sync_api import Error as PWError\r\n\r\nimport config\r\nimport procs\r\nimport zoom_notes\r\n\r\n\r\ndef _logged_in_page(context):\r\n    """Return the first open page/tab that looks authenticated, else None."""\r\n    for pg in list(context.pages):\r\n        try:\r\n            if zoom_notes.is_logged_in(pg):\r\n                return pg\r\n        except PWError:\r\n            continue\r\n    return None\r\n\r\n\r\ndef interactive_login(wait_seconds: int = None) -> bool:\r\n    """Open a visible browser, let the user sign in, and save the session.\r\n\r\n    Returns True if login succeeded and the session was saved. Owns its browser\r\n    lifecycle completely; callers must not hold another Playwright Edge session\r\n    open while this runs.\r\n    """\r\n    wait_seconds = wait_seconds if wait_seconds is not None else config.LOGIN_WAIT_SECONDS\r\n    config.ensure_dirs()\r\n    config.validate_config()\r\n\r\n    run_token = f"zoom-login-{uuid.uuid4().hex}"\r\n    session = procs.BrowserSession(\r\n        headless=False,\r\n        run_token=run_token,\r\n        process_names=config.browser_process_names(),\r\n        launch_kwargs=config.launch_kwargs(headless=False),\r\n        new_context_fn=config.new_context,\r\n        use_saved_state=True,\r\n    )\r\n\r\n    try:\r\n        session.start()\r\n        context = session.context\r\n        page = session.page\r\n\r\n        print(f"Opening {config.redact_url(config.NOTES_URL)} ...", flush=True)\r\n        try:\r\n            page.goto(config.NOTES_URL, wait_until="domcontentloaded")\r\n        except PWError as exc:\r\n            print(f"Initial navigation warning: {exc}", flush=True)\r\n\r\n        print("Please complete the sign-in in the browser window.", flush=True)\r\n        print(f"Waiting up to {wait_seconds}s for the notes list to appear...", flush=True)\r\n\r\n        # Let redirects settle before auth checks.\r\n        time.sleep(5)\r\n\r\n        deadline = time.time() + wait_seconds\r\n        authed_page = None\r\n        last_report = 0.0\r\n        while time.time() < deadline:\r\n            if not context.pages:\r\n                print("  [info] no tabs open; reopening notes page...", flush=True)\r\n                try:\r\n                    newp = context.new_page()\r\n                    newp.goto(config.NOTES_URL, wait_until="domcontentloaded")\r\n                except PWError as exc:\r\n                    print(f"  [info] reopen failed: {exc}", flush=True)\r\n                    time.sleep(2)\r\n                    continue\r\n\r\n            authed_page = _logged_in_page(context)\r\n            if authed_page is not None:\r\n                break\r\n\r\n            now = time.time()\r\n            if now - last_report > 10:\r\n                urls = []\r\n                for pg in list(context.pages):\r\n                    try:\r\n                        urls.append(config.redact_url(pg.url))\r\n                    except PWError:\r\n                        pass\r\n                print(f"  [waiting] open tabs: {urls}", flush=True)\r\n                last_report = now\r\n            time.sleep(2)\r\n\r\n        logged_in = authed_page is not None\r\n        if logged_in:\r\n            time.sleep(2)\r\n            try:\r\n                config.save_storage_state(context)\r\n                print(\r\n                    f"Login successful (url: {config.redact_url(authed_page.url)}). "\r\n                    f"Session saved to {config.STORAGE_STATE}",\r\n                    flush=True,\r\n                )\r\n            except PWError as exc:\r\n                logged_in = False\r\n                print(f"Session save failed: {exc}", flush=True)\r\n        else:\r\n            print("Timed out / no authenticated tab. Session NOT saved.", flush=True)\r\n\r\n        return logged_in\r\n    finally:\r\n        session.stop()\r\n\r\n\r\nif __name__ == "__main__":\r\n    try:\r\n        ok = interactive_login()\r\n    except Exception as exc:  # noqa: BLE001\r\n        print(f"Login failed: {exc}", flush=True)\r\n        ok = False\r\n    sys.exit(0 if ok else 1)\r\n',
+  "config.py": `"""Central configuration for the Zoom Notes transcript sync.\r
+\r
+All tunables live here so the rest of the code stays declarative. Paths are\r
+resolved relative to this file so the scripts work regardless of the current\r
+working directory (important when launched from Task Scheduler).\r
+"""\r
+\r
+from __future__ import annotations\r
+\r
+import os\r
+import re\r
+import sys\r
+from pathlib import Path\r
+from typing import List\r
+from urllib.parse import urlparse\r
+\r
+BASE_DIR = Path(__file__).resolve().parent\r
+\r
+# --- Target ---------------------------------------------------------------\r
+_DEFAULT_NOTES_URL = "https://docs.zoom.us/notes?from=client"\r
+NOTES_URL = os.environ.get("ZOOM_NOTES_URL", _DEFAULT_NOTES_URL)\r
+\r
+# Hostnames allowed for automated navigation (authenticated browser).\r
+_DEFAULT_ALLOWED_HOSTS = ("docs.zoom.us",)\r
+ALLOWED_HOSTS = tuple(\r
+    h.strip().lower()\r
+    for h in os.environ.get("ZOOM_ALLOWED_HOSTS", ",".join(_DEFAULT_ALLOWED_HOSTS)).split(",")\r
+    if h.strip()\r
+)\r
+\r
+# Substring that indicates we were bounced to a sign-in page (not logged in).\r
+SIGNIN_URL_MARKERS = ("/signin", "zoom.us/signin", "/oauth", "/saml")\r
+\r
+# --- Filesystem -----------------------------------------------------------\r
+STORAGE_STATE = BASE_DIR / "storage_state.json"\r
+DATA_DIR = Path(os.environ.get("ZOOM_DATA_DIR", str(BASE_DIR / "data")))\r
+# Transcript destination (may live outside the repo, e.g. an Obsidian vault).\r
+# Override with ZOOM_TRANSCRIPTS_DIR. Index/backoff stay under DATA_DIR.\r
+_DEFAULT_TRANSCRIPTS_DIR = str(BASE_DIR / "mynotes")\r
+TRANSCRIPTS_DIR = Path(\r
+    os.environ.get("ZOOM_TRANSCRIPTS_DIR", _DEFAULT_TRANSCRIPTS_DIR)\r
+)\r
+INDEX_FILE = DATA_DIR / "index.json"\r
+LOGS_DIR = Path(os.environ.get("ZOOM_LOGS_DIR", str(BASE_DIR / "logs")))\r
+DIAGNOSTICS_DIR = LOGS_DIR / "diagnostics"\r
+LOCK_FILE = BASE_DIR / "sync.lock"\r
+\r
+# --- Browser --------------------------------------------------------------\r
+# Use an installed, IT-approved browser instead of Playwright's bundled\r
+# Chromium (which may be blocked by security policy). Valid channels:\r
+# "msedge", "chrome", "chrome-beta", "msedge-beta", etc. Set to "" (empty)\r
+# to fall back to Playwright's bundled Chromium (requires \`playwright install\`).\r
+# Prefer real desktop browsers: Edge (Windows), Chrome (macOS), Chromium (Linux).\r
+if os.name == "nt":\r
+    _DEFAULT_CHANNEL = "msedge"\r
+elif sys.platform == "darwin":\r
+    _DEFAULT_CHANNEL = "chrome"\r
+else:\r
+    _DEFAULT_CHANNEL = ""\r
+# Empty env var must fall through to default (os.environ.get("", default) returns "").\r
+_raw_channel = os.environ.get("ZOOM_BROWSER_CHANNEL")\r
+BROWSER_CHANNEL = _DEFAULT_CHANNEL if _raw_channel is None or _raw_channel.strip() == "" else _raw_channel.strip()\r
+\r
+\r
+def _env_bool(name: str, default: bool) -> bool:\r
+    raw = os.environ.get(name)\r
+    if raw is None:\r
+        return default\r
+    return raw.strip().lower() in ("1", "true", "t", "yes", "y", "on")\r
+\r
+\r
+def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:\r
+    raw = os.environ.get(name)\r
+    if raw is None or raw.strip() == "":\r
+        value = default\r
+    else:\r
+        try:\r
+            value = int(raw.strip())\r
+        except ValueError as exc:\r
+            raise ValueError(f"{name} must be an integer, got {raw!r}") from exc\r
+    if minimum is not None and value < minimum:\r
+        raise ValueError(f"{name} must be >= {minimum}, got {value}")\r
+    if maximum is not None and value > maximum:\r
+        raise ValueError(f"{name} must be <= {maximum}, got {value}")\r
+    return value\r
+\r
+\r
+def launch_kwargs(headless: bool) -> dict:\r
+    """Build chromium.launch kwargs, honoring the configured browser channel."""\r
+    kwargs: dict = {"headless": headless}\r
+    if BROWSER_CHANNEL:\r
+        kwargs["channel"] = BROWSER_CHANNEL\r
+    args = [\r
+        "--disable-dev-shm-usage",\r
+        "--no-default-browser-check",\r
+        "--disable-blink-features=AutomationControlled",\r
+    ]\r
+    # macOS: avoid background throttling that stalls Zoom\u2019s SPA in automation.\r
+    if sys.platform == "darwin":\r
+        args.extend(\r
+            [\r
+                "--disable-background-timer-throttling",\r
+                "--disable-backgrounding-occluded-windows",\r
+                "--disable-renderer-backgrounding",\r
+            ]\r
+        )\r
+    kwargs["args"] = args\r
+    return kwargs\r
+\r
+\r
+def new_context(browser, use_saved_state: bool = True):\r
+    """Create a non-persistent context, loading the saved session if present.\r
+\r
+    Non-persistent contexts use a throwaway profile, avoiding the profile-lock\r
+    problems that plague persistent contexts on Windows. The authenticated\r
+    session is carried via STORAGE_STATE instead.\r
+    """\r
+    # Note: downloads_path is only valid on launch_persistent_context, not new_context.\r
+    # File downloads are saved via page.expect_download() + download.save_as(...).\r
+    kwargs: dict = {\r
+        "accept_downloads": True,\r
+        "viewport": {"width": 1400, "height": 900},\r
+        "locale": "en-US",\r
+        # Required for Zoom "Copy page content" \u2192 clipboard workflow.\r
+        "permissions": ["clipboard-read", "clipboard-write"],\r
+    }\r
+    if use_saved_state and STORAGE_STATE.exists():\r
+        kwargs["storage_state"] = str(STORAGE_STATE)\r
+    ctx = browser.new_context(**kwargs)\r
+    ctx.set_default_navigation_timeout(NAV_TIMEOUT_MS)\r
+    ctx.set_default_timeout(ACTION_TIMEOUT_MS)\r
+    try:\r
+        ctx.grant_permissions(\r
+            ["clipboard-read", "clipboard-write"],\r
+            origin="https://docs.zoom.us",\r
+        )\r
+    except Exception:\r
+        pass\r
+    return ctx\r
+\r
+\r
+def save_storage_state(context) -> None:\r
+    """Atomically persist the browser storage state."""\r
+    STORAGE_STATE.parent.mkdir(parents=True, exist_ok=True)\r
+    tmp = STORAGE_STATE.with_suffix(STORAGE_STATE.suffix + ".tmp")\r
+    bak = STORAGE_STATE.with_suffix(STORAGE_STATE.suffix + ".bak")\r
+    context.storage_state(path=str(tmp))\r
+    if STORAGE_STATE.exists():\r
+        try:\r
+            if bak.exists():\r
+                bak.unlink()\r
+            STORAGE_STATE.replace(bak)\r
+        except OSError:\r
+            pass\r
+    tmp.replace(STORAGE_STATE)\r
+\r
+\r
+def validate_notes_url(url: str = None) -> str:\r
+    """Validate NOTES_URL is https and on an allowed Zoom host. Returns the URL."""\r
+    candidate = (url if url is not None else NOTES_URL).strip()\r
+    parsed = urlparse(candidate)\r
+    if parsed.scheme.lower() != "https":\r
+        raise ValueError(f"ZOOM_NOTES_URL must be https, got scheme={parsed.scheme!r}")\r
+    host = (parsed.hostname or "").lower()\r
+    if host not in ALLOWED_HOSTS:\r
+        raise ValueError(\r
+            f"ZOOM_NOTES_URL host {host!r} is not allowed; allowed={list(ALLOWED_HOSTS)}"\r
+        )\r
+    return candidate\r
+\r
+\r
+def browser_process_names() -> List[str]:\r
+    """Process image names used by the configured channel (for scoped cleanup)."""\r
+    channel = (BROWSER_CHANNEL or "").lower()\r
+    if os.name == "nt":\r
+        if channel.startswith("msedge"):\r
+            return ["msedge.exe"]\r
+        if channel.startswith("chrome"):\r
+            return ["chrome.exe"]\r
+        return ["chrome.exe", "chromium.exe"]\r
+    # macOS / Linux process names (for pgrep/pkill token cleanup)\r
+    if channel.startswith("msedge") or channel.startswith("edge"):\r
+        return ["Microsoft Edge", "msedge"]\r
+    if channel.startswith("chrome"):\r
+        return ["Google Chrome", "chrome"]\r
+    return ["Chromium", "chrome", "chromium"]\r
+\r
+\r
+# --- Behaviour ------------------------------------------------------------\r
+# Run headless during scheduled syncs. Re-auth temporarily forces a headed\r
+# window regardless of this value.\r
+HEADLESS = _env_bool("ZOOM_HEADLESS", True)\r
+\r
+# Max note open/download attempts per run (work budget, not visibility ceiling).\r
+MAX_ITEMS = _env_int("ZOOM_MAX_ITEMS", 25, minimum=1, maximum=500)\r
+\r
+# Stop scanning after this many consecutive already-known notes once the list\r
+# end has been reached (or scroll produces no new rows).\r
+STOP_AFTER_KNOWN = _env_int("ZOOM_STOP_AFTER_KNOWN", 3, minimum=1, maximum=100)\r
+\r
+# Max scroll steps while collecting/scanning the notes list.\r
+MAX_SCROLL_STEPS = _env_int("ZOOM_MAX_SCROLL_STEPS", 30, minimum=0, maximum=200)\r
+\r
+# Timeouts (milliseconds).\r
+NAV_TIMEOUT_MS = _env_int("ZOOM_NAV_TIMEOUT_MS", 45000, minimum=1000)\r
+ACTION_TIMEOUT_MS = _env_int("ZOOM_ACTION_TIMEOUT_MS", 20000, minimum=1000)\r
+DOWNLOAD_TIMEOUT_MS = _env_int("ZOOM_DOWNLOAD_TIMEOUT_MS", 60000, minimum=1000)\r
+\r
+# How long (seconds) to wait for the human to finish logging in during the\r
+# interactive re-auth flow.\r
+LOGIN_WAIT_SECONDS = _env_int("ZOOM_LOGIN_WAIT_SECONDS", 300, minimum=30, maximum=3600)\r
+\r
+# Treat a lock file older than this many minutes (by heartbeat) as stale.\r
+LOCK_STALE_MINUTES = _env_int("ZOOM_LOCK_STALE_MINUTES", 25, minimum=1, maximum=240)\r
+\r
+# Log retention and privacy.\r
+LOG_RETENTION_DAYS = _env_int("ZOOM_LOG_RETENTION_DAYS", 30, minimum=1, maximum=3650)\r
+LOG_TITLES = _env_bool("ZOOM_LOG_TITLES", False)\r
+APPLY_ACLS = _env_bool("ZOOM_APPLY_ACLS", True)\r
+# New downloads only: omit title from filename (date prefix + id only; existing untouched).\r
+PRIVACY_FILENAMES = _env_bool("ZOOM_PRIVACY_FILENAMES", False)\r
+# Require opened-note title to match before downloading (hard fail on clear mismatch).\r
+STRICT_OPEN_VERIFY = _env_bool("ZOOM_STRICT_OPEN_VERIFY", True)\r
+# Run Playwright work in a child process so hung Edge can be killed as a tree.\r
+WORKER_ISOLATION = _env_bool("ZOOM_WORKER_ISOLATION", True)\r
+# Max seconds the parent waits for the browser worker (includes login wait headroom).\r
+WORKER_TIMEOUT_SECONDS = _env_int("ZOOM_WORKER_TIMEOUT_SECONDS", 1200, minimum=60, maximum=7200)\r
+\r
+# Absent-transcript backoff schedule in hours (comma-separated).\r
+_DEFAULT_BACKOFF_HOURS = "6,24,72,168"\r
+\r
+\r
+def absent_backoff_hours() -> List[int]:\r
+    raw = os.environ.get("ZOOM_ABSENT_BACKOFF_HOURS", _DEFAULT_BACKOFF_HOURS)\r
+    hours: List[int] = []\r
+    for part in raw.split(","):\r
+        part = part.strip()\r
+        if not part:\r
+            continue\r
+        value = int(part)\r
+        if value < 1:\r
+            raise ValueError("ZOOM_ABSENT_BACKOFF_HOURS values must be >= 1")\r
+        hours.append(value)\r
+    if not hours:\r
+        hours = [6, 24, 72, 168]\r
+    return hours\r
+\r
+\r
+def ensure_dirs() -> None:\r
+    """Create the runtime directories if they don't exist yet."""\r
+    TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)\r
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)\r
+    DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)\r
+\r
+\r
+def redact_url(url: str) -> str:\r
+    """Strip query string and fragment from a URL for safe logging."""\r
+    if not url:\r
+        return ""\r
+    try:\r
+        parsed = urlparse(url)\r
+        host = parsed.netloc or ""\r
+        path = parsed.path or ""\r
+        return f"{parsed.scheme}://{host}{path}" if parsed.scheme else f"{host}{path}"\r
+    except Exception:\r
+        return re.sub(r"[?#].*$", "", url)\r
+\r
+\r
+def note_label(note_id: str, title: str = "") -> str:\r
+    """Human-readable log label; titles are opt-in via ZOOM_LOG_TITLES."""\r
+    if LOG_TITLES and title:\r
+        return f"{note_id} ({title})"\r
+    return note_id\r
+\r
+\r
+def validate_config() -> None:\r
+    """Validate configuration early; raise ValueError on bad values."""\r
+    validate_notes_url(NOTES_URL)\r
+    # Touch validated ints already parsed at import; re-check backoff.\r
+    absent_backoff_hours()\r
+    if not ALLOWED_HOSTS:\r
+        raise ValueError("ZOOM_ALLOWED_HOSTS must list at least one host")\r
+\r
+\r
+def prune_old_logs(directory: Path = None, retention_days: int = None) -> int:\r
+    """Delete dated log files older than retention. Returns number removed."""\r
+    import time\r
+\r
+    directory = directory or LOGS_DIR\r
+    retention_days = LOG_RETENTION_DAYS if retention_days is None else retention_days\r
+    if not directory.exists():\r
+        return 0\r
+    cutoff = time.time() - (retention_days * 86400)\r
+    removed = 0\r
+    patterns = ("sync-*.log", "run-*.log")\r
+    for pattern in patterns:\r
+        for path in directory.glob(pattern):\r
+            try:\r
+                if path.is_file() and path.stat().st_mtime < cutoff:\r
+                    path.unlink(missing_ok=True)\r
+                    removed += 1\r
+            except OSError:\r
+                continue\r
+    # Cap diagnostics to newest 20 files.\r
+    try:\r
+        diags = sorted(\r
+            DIAGNOSTICS_DIR.glob("*"),\r
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,\r
+            reverse=True,\r
+        )\r
+        for stale in diags[20:]:\r
+            try:\r
+                stale.unlink(missing_ok=True)\r
+            except OSError:\r
+                pass\r
+    except OSError:\r
+        pass\r
+    return removed\r
 `,
-  "zoom_notes.py": `"""Playwright page helpers for the Zoom Notes (docs.zoom.us/notes) UI.
-
-Workflow (Zoom no longer offers Download transcript):
-  1. Open My Notes list at docs.zoom.us/notes
-  2. Open each note
-  3. Top-right \u22EE menu \u2192 "Copy page content"
-  4. Read clipboard and save as the transcript file
-
-Selectors are centralized and role/text based where possible.
-"""
-
-from __future__ import annotations
-
-import hashlib
-import re
-from dataclasses import dataclass
-from enum import Enum
-from pathlib import Path
-from typing import List, Optional, Sequence, Set
-from urllib.parse import urlparse
-
-from playwright.sync_api import (
-    Error as PWError,
-    Locator,
-    Page,
-    TimeoutError as PWTimeoutError,
-)
-
-import config
-
-# --- Tunable selectors ----------------------------------------------------
-SELECTORS = {
-    "app_ready": [
-        'text=My Notes',
-        'button:has-text("Import")',
-        'text=Shared folders',
-    ],
-    "notes_pane_hints": [
-        'text=My Notes',
-    ],
-    "note_items": [
-        '[role="listitem"]',
-        '[data-testid="note-list-item"]',
-    ],
-    "kebab": [
-        'button[aria-label="More"]',
-        'button[aria-label*="More" i]',
-        'button[aria-label*="more" i]',
-        'button[aria-label*="options" i]',
-        'button[aria-label*="Page options" i]',
-        'button[aria-haspopup="menu"]',
-        'button[data-testid*="more" i]',
-        'button[data-testid*="menu" i]',
-    ],
-    "copy_page_content": [
-        '[role="menuitem"]:has-text("Copy page content")',
-        '[role="menuitem"]:has-text("Copy Page Content")',
-        'text="Copy page content"',
-        'text=/copy\\\\s+page\\\\s+content/i',
-        'button:has-text("Copy page content")',
-    ],
-    "transcript_tab": [
-        '[role="tab"]:has-text("Transcript")',
-        'button:has-text("Transcript")',
-        'text=Transcript',
-    ],
-    "opened_title": [
-        '[data-testid="note-title"]',
-        '[class*="note-title" i]',
-        'main h1',
-        '[role="main"] h1',
-        'h1',
-    ],
-}
-
-# Sidebar / chrome labels that must never be treated as meeting notes.
-NAV_DENYLIST = {
-    "home",
-    "search",
-    "help me write",
-    "starred",
-    "notifications",
-    "my docs",
-    "my notes",
-    "meetings",
-    "shared folders",
-    "import",
-    "shared with me",
-    "trash",
-    "settings",
-}
-
-# Opened-view chrome that is NOT the meeting title (strict verify must ignore these).
-OPENED_TITLE_DENYLIST = {
-    "page options",
-    "more",
-    "more options",
-    "options",
-    "download transcript",
-    "manual notes",
-    "transcript",
-    "workflow",
-    "share",
-    "import",
-    "my notes",
-}
-
-_ID_FROM_URL = re.compile(
-    r"/notes/([A-Za-z0-9_\\-]{6,})|[?&](?:doc|docId|noteId|id)=([A-Za-z0-9_\\-]{6,})"
-)
-
-
-class DownloadOutcome(str, Enum):
-    DOWNLOADED = "downloaded"
-    ABSENT = "absent"
-    RETRYABLE = "retryable"
-    SELECTOR_BROKEN = "selector_broken"
-
-
-@dataclass
-class DownloadResult:
-    outcome: DownloadOutcome
-    path: Optional[Path] = None
-    size: int = 0
-    sha256: str = ""
-    error: str = ""
-
-
-class OpenMismatchError(RuntimeError):
-    """Opened note title does not match the intended list row."""
-
-
-@dataclass
-class NoteRef:
-    index: int
-    title: str
-    host: str = ""
-    date: str = ""
-    note_id: str = ""
-    url: str = ""
-    raw_text: str = ""
-
-    def stable_id(self) -> str:
-        """Stable dedup key: prefer real note id, else hash of metadata."""
-        if self.note_id:
-            return self.note_id
-        seed = f"{self.title}|{self.host}|{self.date}".encode("utf-8")
-        return "h_" + hashlib.sha1(seed).hexdigest()[:16]
-
-    def metadata_id(self) -> str:
-        seed = f"{self.title}|{self.host}|{self.date}".encode("utf-8")
-        return "h_" + hashlib.sha1(seed).hexdigest()[:16]
-
-
-def _first_usable(page: Page, candidates: Sequence[str], *, root: Locator = None) -> Optional[Locator]:
-    base = root if root is not None else page
-    for sel in candidates:
-        try:
-            loc = base.locator(sel)
-            count = loc.count()
-        except PWError:
-            continue
-        for i in range(min(count, 25)):
-            item = loc.nth(i)
-            try:
-                if item.is_visible():
-                    return item
-            except PWError:
-                continue
-        # Fall back to first match even if visibility check failed.
-        try:
-            if count > 0:
-                return loc.first
-        except PWError:
-            continue
-    return None
-
-
-def _all_visible(page: Page, candidates: Sequence[str], *, root: Locator = None) -> List[Locator]:
-    base = root if root is not None else page
-    for sel in candidates:
-        try:
-            loc = base.locator(sel)
-            count = loc.count()
-        except PWError:
-            continue
-        if count <= 0:
-            continue
-        items: List[Locator] = []
-        for i in range(count):
-            item = loc.nth(i)
-            try:
-                if item.is_visible():
-                    items.append(item)
-            except PWError:
-                continue
-        if items:
-            return items
-    return []
-
-
-def is_logged_in(page: Page) -> bool:
-    """DOM-first auth check against the notes app shell."""
-    for sel in SELECTORS["app_ready"]:
-        try:
-            loc = page.locator(sel)
-            if loc.count() > 0 and loc.first.is_visible():
-                return True
-        except PWError:
-            continue
-
-    url = (page.url or "").lower()
-    if any(marker in url for marker in config.SIGNIN_URL_MARKERS):
-        return False
-    try:
-        host = (urlparse(page.url or "").hostname or "").lower()
-    except Exception:
-        host = ""
-    if host in config.ALLOWED_HOSTS and "/notes" in url:
-        # URL alone is weak; require at least one app_ready attempt already failed.
-        return False
-    return False
-
-
-def _note_id_from_url(url: str) -> str:
-    m = _ID_FROM_URL.search(url or "")
-    if not m:
-        return ""
-    return m.group(1) or m.group(2) or ""
-
-
-def _clean(text: str) -> str:
-    return re.sub(r"\\s+", " ", (text or "")).strip()
-
-
-def _is_nav_title(title: str) -> bool:
-    return _clean(title).lower() in NAV_DENYLIST
-
-
-def _looks_like_note_row(title: str, host: str, date: str, lines: Sequence[str]) -> bool:
-    if _is_nav_title(title):
-        return False
-    if host:
-        return True
-    if date and len(lines) >= 2:
-        return True
-    # Single-line chrome labels are not notes.
-    if len(lines) <= 1:
-        return False
-    return True
-
-
-def wait_for_notes(page: Page, timeout_ms: int = None) -> bool:
-    """Wait until note rows render. Returns False on timeout."""
-    timeout_ms = timeout_ms or config.ACTION_TIMEOUT_MS
-    for sel in SELECTORS["note_items"]:
-        try:
-            page.wait_for_selector(sel, timeout=timeout_ms, state="visible")
-            return True
-        except (PWTimeoutError, PWError):
-            continue
-    return False
-
-
-def _parse_row_text(raw: str) -> tuple[str, str, str, List[str]]:
-    lines = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
-    if not lines:
-        return "", "", "", []
-    title = lines[0][:200]
-    date = ""
-    host = ""
-    for ln in lines[1:]:
-        if ln.lower().startswith("host:"):
-            host = ln.split(":", 1)[1].strip()
-        elif not date:
-            date = ln
-    return title, host, date, lines
-
-
-def list_notes(page: Page, max_items: int) -> List[NoteRef]:
-    """Return up to max_items meeting notes from the list (newest-first)."""
-    wait_for_notes(page)
-    items = _all_visible(page, SELECTORS["note_items"])
-    notes: List[NoteRef] = []
-    if not items:
-        return notes
-
-    for i, row in enumerate(items):
-        if len(notes) >= max_items:
-            break
-        try:
-            raw = row.inner_text(timeout=config.ACTION_TIMEOUT_MS)
-        except PWTimeoutError:
-            continue
-        title, host, date, lines = _parse_row_text(raw)
-        if not title:
-            continue
-        if not _looks_like_note_row(title, host, date, lines):
-            continue
-        notes.append(
-            NoteRef(
-                index=i,
-                title=title,
-                host=host,
-                date=date,
-                raw_text=raw,
-            )
-        )
-    return notes
-
-
-def scroll_notes_list(page: Page) -> bool:
-    """Scroll the notes list to load more rows. Returns True if scroll ran."""
-    items = _all_visible(page, SELECTORS["note_items"])
-    if not items:
-        return False
-    try:
-        items[-1].scroll_into_view_if_needed(timeout=config.ACTION_TIMEOUT_MS)
-        page.wait_for_timeout(800)
-        page.mouse.wheel(0, 1200)
-        page.wait_for_timeout(800)
-        return True
-    except PWError:
-        return False
-
-
-def collect_notes(page: Page, max_items: int, max_scroll_steps: int = None) -> List[NoteRef]:
-    """Collect notes with limited scrolling (dedupe by metadata id)."""
-    max_scroll_steps = config.MAX_SCROLL_STEPS if max_scroll_steps is None else max_scroll_steps
-    seen: Set[str] = set()
-    collected: List[NoteRef] = []
-    stagnant = 0
-
-    for step in range(max_scroll_steps + 1):
-        batch = list_notes(page, max_items=max(max_items * 3, 50))
-        grew = 0
-        for note in batch:
-            mid = note.metadata_id()
-            if mid in seen:
-                continue
-            seen.add(mid)
-            collected.append(note)
-            grew += 1
-            if len(collected) >= max_items * 3:
-                break
-        if len(collected) >= max_items and grew == 0:
-            stagnant += 1
-        else:
-            stagnant = 0 if grew else stagnant + 1
-        if stagnant >= 2:
-            break
-        if step >= max_scroll_steps:
-            break
-        if not scroll_notes_list(page):
-            break
-    return collected[: max(max_items * 3, len(collected))]
-
-
-def _normalize(s: str) -> str:
-    return re.sub(r"\\s+", " ", (s or "")).strip().lower()
-
-
-def open_note(page: Page, note: NoteRef) -> None:
-    """Click the note row matching metadata and verify the note view loaded."""
-    items = _all_visible(page, SELECTORS["note_items"])
-    if not items:
-        raise RuntimeError("Note list disappeared before opening a note")
-
-    target: Optional[Locator] = None
-    # Prefer exact raw-text / title match over stale positional index.
-    want_title = _normalize(note.title)
-    for row in items:
-        try:
-            raw = row.inner_text(timeout=3000)
-        except PWError:
-            continue
-        title, host, date, _lines = _parse_row_text(raw)
-        if _normalize(title) == want_title:
-            if note.host and host and _normalize(host) != _normalize(note.host):
-                continue
-            target = row
-            break
-    if target is None and 0 <= note.index < len(items):
-        target = items[note.index]
-    if target is None:
-        raise RuntimeError(f"Could not locate note row for {note.title!r}")
-
-    target.click(timeout=config.ACTION_TIMEOUT_MS)
-    # Client-side view swap; wait for note body/title (not just shell chrome).
-    page.wait_for_timeout(2500)
-    _wait_opened(page, note)
-    note.url = page.url
-    note.note_id = _note_id_from_url(page.url)
-
-
-def _titles_compatible(want: str, shown: str) -> bool:
-    """True if opened title reasonably matches the list-row title."""
-    w = _normalize(want)
-    s = _normalize(shown)
-    if not w or not s:
-        return True  # cannot verify
-    if w == s:
-        return True
-    # UI may truncate, append date, or include extra whitespace/punctuation.
-    w40, s40 = w[:40], s[:40]
-    if w40 and (w40 in s or s40 in w):
-        return True
-    # Token overlap: at least half of significant tokens from want appear in shown.
-    w_tokens = [t for t in re.split(r"[^a-z0-9]+", w) if len(t) > 2]
-    if not w_tokens:
-        return True
-    hits = sum(1 for t in w_tokens if t in s)
-    return hits >= max(1, (len(w_tokens) + 1) // 2)
-
-
-def _is_chrome_title(text: str) -> bool:
-    t = _normalize(text)
-    if not t:
-        return True
-    if t in OPENED_TITLE_DENYLIST or t in NAV_DENYLIST:
-        return True
-    # Very short generic labels are almost never meeting titles.
-    if len(t) < 4:
-        return True
-    return False
-
-
-def _read_opened_title(page: Page) -> str:
-    """Return the best candidate meeting title from the opened note view."""
-    for sel in SELECTORS["opened_title"]:
-        try:
-            loc = page.locator(sel)
-            count = min(loc.count(), 10)
-        except PWError:
-            continue
-        for i in range(count):
-            try:
-                item = loc.nth(i)
-                if not item.is_visible():
-                    continue
-                text = _clean(item.inner_text(timeout=1500))
-            except PWError:
-                continue
-            if _is_chrome_title(text):
-                continue
-            return text
-    return ""
-
-
-def _page_shows_title(page: Page, title: str) -> bool:
-    """True if the expected meeting title is visible somewhere on the page."""
-    want = _clean(title)
-    if not want:
-        return False
-    # Try progressively shorter prefixes (UI may truncate).
-    candidates = [want, want[:80], want[:60], want[:40]]
-    seen = set()
-    for c in candidates:
-        c = c.strip()
-        if len(c) < 12 or c in seen:
-            continue
-        seen.add(c)
-        try:
-            loc = page.get_by_text(c, exact=False)
-            n = min(loc.count(), 8)
-            for i in range(n):
-                try:
-                    if loc.nth(i).is_visible():
-                        return True
-                except PWError:
-                    continue
-        except PWError:
-            continue
-    return False
-
-
-def _wait_opened(page: Page, note: NoteRef) -> None:
-    """Verify the note chrome rendered; hard-fail on clear title mismatch when enabled."""
-    # Note body/title often paints after the shell; give it a moment.
-    page.wait_for_timeout(800)
-
-    # Strongest signal: expected title text is visible (matches live Zoom layout).
-    if _page_shows_title(page, note.title):
-        return
-
-    kebab = _first_usable(page, SELECTORS["kebab"])
-    if kebab is None:
-        page.wait_for_timeout(1200)
-        kebab = _first_usable(page, SELECTORS["kebab"])
-        if _page_shows_title(page, note.title):
-            return
-
-    shown = _read_opened_title(page)
-
-    # Only enforce mismatch when we found a real title candidate (not UI chrome).
-    if shown and not _is_chrome_title(shown) and not _titles_compatible(note.title, shown):
-        if config.STRICT_OPEN_VERIFY:
-            raise OpenMismatchError(
-                f"opened title {shown!r} does not match expected {note.title!r}"
-            )
-
-    if kebab is None and not shown and not _page_shows_title(page, note.title):
-        # Still proceed; copy-page-content will report selector issues.
-        page.wait_for_timeout(500)
-
-
-def _menu_item_labels(page: Page) -> List[str]:
-    """Collect visible menu/list item labels for diagnostics."""
-    labels: List[str] = []
-    try:
-        loc = page.get_by_role("menuitem")
-        count = min(loc.count(), 40)
-        for i in range(count):
-            try:
-                item = loc.nth(i)
-                if not item.is_visible():
-                    continue
-                text = _clean(item.inner_text(timeout=500))
-            except PWError:
-                continue
-            if text and text not in labels and len(text) < 120:
-                labels.append(text)
-    except PWError:
-        pass
-    return labels
-
-
-def _click_timeout_ms() -> int:
-    return min(5000, int(config.ACTION_TIMEOUT_MS))
-
-
-def _safe_click(locator: Locator, *, timeout_ms: int = None) -> Optional[str]:
-    """Click a locator; return None on success or an error string."""
-    timeout_ms = timeout_ms if timeout_ms is not None else _click_timeout_ms()
-    try:
-        locator.scroll_into_view_if_needed(timeout=timeout_ms)
-    except PWError:
-        pass
-    try:
-        locator.click(timeout=timeout_ms, force=False)
-        return None
-    except PWError:
-        pass
-    try:
-        locator.click(timeout=timeout_ms, force=True)
-        return None
-    except PWError as exc:
-        return str(exc)[:240]
-
-
-def _menuitem_by_name(page: Page, pattern: re.Pattern[str]) -> Optional[Locator]:
-    """Return a stable role=menuitem locator matched by accessible name."""
-    try:
-        loc = page.get_by_role("menuitem", name=pattern)
-        if loc.count() <= 0:
-            return None
-        first = loc.first
-        if first.is_visible():
-            return first
-    except PWError:
-        return None
-    return None
-
-
-def _all_kebabs(page: Page) -> List[Locator]:
-    """Return distinct visible \u22EE / More buttons; top-right preferred."""
-    found: List[Locator] = []
-    seen: Set[str] = set()
-    for sel in SELECTORS["kebab"]:
-        try:
-            loc = page.locator(sel)
-            count = min(loc.count(), 12)
-        except PWError:
-            continue
-        for i in range(count):
-            try:
-                item = loc.nth(i)
-                if not item.is_visible():
-                    continue
-                box = item.bounding_box()
-                key = (
-                    f"{int(box['x'])}:{int(box['y'])}"
-                    if box
-                    else f"{sel}:{i}"
-                )
-            except PWError:
-                continue
-            if key in seen:
-                continue
-            seen.add(key)
-            found.append(item)
-
-    def _sort_key(el: Locator) -> tuple:
-        # Prefer upper-right chrome (page options), not sidebar.
-        try:
-            box = el.bounding_box() or {"x": 0, "y": 9999}
-            return (float(box.get("y", 9999)), -float(box.get("x", 0)))
-        except PWError:
-            return (9999.0, 0.0)
-
-    found.sort(key=_sort_key)
-    return found
-
-
-def _write_text_download(dest: Path, text: str) -> DownloadResult:
-    body = (text or "").strip()
-    if len(body) < 20:
-        return DownloadResult(DownloadOutcome.ABSENT, error="copied page content too short")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    part = dest.with_suffix(dest.suffix + ".part")
-    data = (body + "\\n").encode("utf-8")
-    part.write_bytes(data)
-    digest = hashlib.sha256(data).hexdigest()
-    part.replace(dest)
-    return DownloadResult(
-        DownloadOutcome.DOWNLOADED,
-        path=dest,
-        size=len(data),
-        sha256=digest,
-    )
-
-
-def _clear_clipboard(page: Page) -> None:
-    try:
-        page.evaluate(
-            """async () => {
-                try { await navigator.clipboard.writeText(''); } catch (e) {}
-            }"""
-        )
-    except PWError:
-        pass
-
-
-def _read_clipboard(page: Page) -> str:
-    """Read text from the system clipboard via the page context."""
-    try:
-        text = page.evaluate(
-            """async () => {
-                try {
-                    return await navigator.clipboard.readText();
-                } catch (e) {
-                    return '';
-                }
-            }"""
-        )
-        if isinstance(text, str) and text.strip():
-            return text
-    except PWError:
-        pass
-    return ""
-
-
-def _find_copy_page_content_item(page: Page) -> Optional[Locator]:
-    """Locate the Zoom 'Copy page content' menu item."""
-    patterns = (
-        re.compile(r"copy\\s+page\\s+content", re.I),
-        re.compile(r"copy\\s+content", re.I),
-        re.compile(r"copy\\s+page", re.I),
-    )
-    for pat in patterns:
-        item = _menuitem_by_name(page, pat)
-        if item is not None:
-            return item
-    item = _first_usable(page, SELECTORS["copy_page_content"])
-    if item is not None:
-        return item
-    # Last resort: any visible control whose text matches.
-    try:
-        loc = page.get_by_text(re.compile(r"copy\\s+page\\s+content", re.I))
-        if loc.count() > 0 and loc.first.is_visible():
-            return loc.first
-    except PWError:
-        pass
-    return None
-
-
-def _try_copy_page_content(page: Page, dest: Path) -> DownloadResult:
-    """\u22EE \u2192 Copy page content \u2192 clipboard \u2192 file."""
-    try:
-        page.context.grant_permissions(
-            ["clipboard-read", "clipboard-write"],
-            origin="https://docs.zoom.us",
-        )
-    except Exception:
-        pass
-
-    kebabs = _all_kebabs(page)
-    if not kebabs:
-        return DownloadResult(DownloadOutcome.SELECTOR_BROKEN, error="page options (\u22EE) not found")
-
-    menu_labels_seen: List[str] = []
-    last_error = "Copy page content menu item missing"
-
-    for kebab in kebabs[:6]:
-        _dismiss_menu(page)
-        _clear_clipboard(page)
-
-        err = _safe_click(kebab)
-        if err:
-            last_error = f"\u22EE click failed: {err}"
-            continue
-
-        page.wait_for_timeout(700)
-        for lab in _menu_item_labels(page):
-            if lab not in menu_labels_seen:
-                menu_labels_seen.append(lab)
-
-        target = _find_copy_page_content_item(page)
-        if target is None:
-            last_error = "Copy page content menu item missing"
-            _dismiss_menu(page)
-            continue
-
-        click_err = _safe_click(target, timeout_ms=4000)
-        if click_err:
-            last_error = f"Copy page content click failed: {click_err}"
-            _dismiss_menu(page)
-            continue
-
-        # Clipboard write is async after the menu action.
-        text = ""
-        for _ in range(10):
-            page.wait_for_timeout(250)
-            text = _read_clipboard(page)
-            if text.strip():
-                break
-
-        _dismiss_menu(page)
-
-        if not text.strip():
-            last_error = "clipboard empty after Copy page content"
-            continue
-
-        result = _write_text_download(dest, text)
-        if result.outcome == DownloadOutcome.DOWNLOADED:
-            return result
-        last_error = result.error or "write failed"
-
-    detail = last_error
-    if menu_labels_seen:
-        detail = f"{last_error}; menu items: [{', '.join(menu_labels_seen[:12])}]"
-    return DownloadResult(DownloadOutcome.RETRYABLE, error=detail)
-
-
-def _extract_transcript_from_page(page: Page) -> str:
-    """Fallback: scrape main note body if clipboard copy fails."""
-    container_sels = [
-        "article",
-        '[role="article"]',
-        "main",
-        '[role="main"]',
-        '[contenteditable="true"]',
-    ]
-    best = ""
-    for sel in container_sels:
-        try:
-            loc = page.locator(sel)
-            count = min(loc.count(), 8)
-        except PWError:
-            continue
-        for i in range(count):
-            try:
-                item = loc.nth(i)
-                if not item.is_visible():
-                    continue
-                text = (item.inner_text(timeout=2500) or "").strip()
-            except PWError:
-                continue
-            if len(text) > len(best):
-                best = text
-        if len(best) > 400:
-            break
-    return best
-
-
-def download_transcript(page: Page, dest: Path) -> DownloadResult:
-    """Capture note content via Zoom 'Copy page content' (primary workflow).
-
-    Kept name for sync.py compatibility. No longer uses Download transcript.
-    """
-    copy_result = _try_copy_page_content(page, dest)
-    if copy_result.outcome == DownloadOutcome.DOWNLOADED:
-        return copy_result
-
-    # Fallback scrape of the open note body.
-    scraped = _extract_transcript_from_page(page)
-    if scraped and len(scraped.strip()) >= 40:
-        return _write_text_download(dest, scraped)
-
-    save_diagnostics(page, f"copy-fail-{dest.stem[:40]}")
-    return copy_result
-
-
-def _dismiss_menu(page: Page) -> None:
-    try:
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(300)
-        # Second escape helps nested overlays.
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(200)
-    except PWError:
-        pass
-
-
-def save_diagnostics(page: Page, label: str) -> Optional[Path]:
-    """Best-effort screenshot for selector failures."""
-    try:
-        config.DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
-        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", label)[:60] or "diag"
-        path = config.DIAGNOSTICS_DIR / f"{safe}.png"
-        page.screenshot(path=str(path), full_page=False)
-        return path
-    except Exception:
-        return None
+  "zoom_notes.py": `"""Playwright page helpers for the Zoom Notes (docs.zoom.us/notes) UI.\r
+\r
+Workflow:\r
+  1. Open My Notes list at docs.zoom.us/notes\r
+  2. Open each note\r
+  3. Top-right \u22EE menu \u2192 "Copy page content" (the note summary)\r
+  4. Top-right \u22EE menu \u2192 "Download transcript" (the raw transcript, when available)\r
+  5. Save one .md file: summary on top, raw transcript appended at the bottom\r
+\r
+Selectors are centralized and role/text based where possible.\r
+"""\r
+\r
+from __future__ import annotations\r
+\r
+import hashlib\r
+import re\r
+import uuid\r
+from dataclasses import dataclass\r
+from enum import Enum\r
+from pathlib import Path\r
+from typing import List, Optional, Sequence, Set\r
+from urllib.parse import urlparse\r
+\r
+from playwright.sync_api import (\r
+    Error as PWError,\r
+    Locator,\r
+    Page,\r
+    TimeoutError as PWTimeoutError,\r
+)\r
+\r
+import config\r
+\r
+# --- Tunable selectors ----------------------------------------------------\r
+SELECTORS = {\r
+    "app_ready": [\r
+        'text=My Notes',\r
+        'button:has-text("Import")',\r
+        'text=Shared folders',\r
+    ],\r
+    "notes_pane_hints": [\r
+        'text=My Notes',\r
+    ],\r
+    "note_items": [\r
+        '[role="listitem"]',\r
+        '[data-testid="note-list-item"]',\r
+    ],\r
+    "kebab": [\r
+        'button[aria-label="More"]',\r
+        'button[aria-label*="More" i]',\r
+        'button[aria-label*="more" i]',\r
+        'button[aria-label*="options" i]',\r
+        'button[aria-label*="Page options" i]',\r
+        'button[aria-haspopup="menu"]',\r
+        'button[data-testid*="more" i]',\r
+        'button[data-testid*="menu" i]',\r
+    ],\r
+    "copy_page_content": [\r
+        '[role="menuitem"]:has-text("Copy page content")',\r
+        '[role="menuitem"]:has-text("Copy Page Content")',\r
+        'text="Copy page content"',\r
+        'text=/copy\\\\s+page\\\\s+content/i',\r
+        'button:has-text("Copy page content")',\r
+    ],\r
+    "download_transcript": [\r
+        '[role="menuitem"]:has-text("Download transcript")',\r
+        '[role="menuitem"]:has-text("Download Transcript")',\r
+        'text="Download transcript"',\r
+        'text=/download\\\\s+transcript/i',\r
+        'button:has-text("Download transcript")',\r
+    ],\r
+    "transcript_tab": [\r
+        '[role="tab"]:has-text("Transcript")',\r
+        'button:has-text("Transcript")',\r
+        'text=Transcript',\r
+    ],\r
+    "opened_title": [\r
+        '[data-testid="note-title"]',\r
+        '[class*="note-title" i]',\r
+        'main h1',\r
+        '[role="main"] h1',\r
+        'h1',\r
+    ],\r
+}\r
+\r
+# Sidebar / chrome labels that must never be treated as meeting notes.\r
+NAV_DENYLIST = {\r
+    "home",\r
+    "search",\r
+    "help me write",\r
+    "starred",\r
+    "notifications",\r
+    "my docs",\r
+    "my notes",\r
+    "meetings",\r
+    "shared folders",\r
+    "import",\r
+    "shared with me",\r
+    "trash",\r
+    "settings",\r
+}\r
+\r
+# Opened-view chrome that is NOT the meeting title (strict verify must ignore these).\r
+OPENED_TITLE_DENYLIST = {\r
+    "page options",\r
+    "more",\r
+    "more options",\r
+    "options",\r
+    "download transcript",\r
+    "manual notes",\r
+    "transcript",\r
+    "workflow",\r
+    "share",\r
+    "import",\r
+    "my notes",\r
+}\r
+\r
+_ID_FROM_URL = re.compile(\r
+    r"/notes/([A-Za-z0-9_\\-]{6,})|[?&](?:doc|docId|noteId|id)=([A-Za-z0-9_\\-]{6,})"\r
+)\r
+\r
+\r
+class DownloadOutcome(str, Enum):\r
+    DOWNLOADED = "downloaded"\r
+    ABSENT = "absent"\r
+    RETRYABLE = "retryable"\r
+    SELECTOR_BROKEN = "selector_broken"\r
+\r
+\r
+@dataclass\r
+class DownloadResult:\r
+    outcome: DownloadOutcome\r
+    path: Optional[Path] = None\r
+    size: int = 0\r
+    sha256: str = ""\r
+    error: str = ""\r
+    has_transcript: bool = False\r
+\r
+\r
+class OpenMismatchError(RuntimeError):\r
+    """Opened note title does not match the intended list row."""\r
+\r
+\r
+@dataclass\r
+class NoteRef:\r
+    index: int\r
+    title: str\r
+    host: str = ""\r
+    date: str = ""\r
+    note_id: str = ""\r
+    url: str = ""\r
+    raw_text: str = ""\r
+\r
+    def stable_id(self) -> str:\r
+        """Stable dedup key: prefer real note id, else hash of metadata."""\r
+        if self.note_id:\r
+            return self.note_id\r
+        seed = f"{self.title}|{self.host}|{self.date}".encode("utf-8")\r
+        return "h_" + hashlib.sha1(seed).hexdigest()[:16]\r
+\r
+    def metadata_id(self) -> str:\r
+        seed = f"{self.title}|{self.host}|{self.date}".encode("utf-8")\r
+        return "h_" + hashlib.sha1(seed).hexdigest()[:16]\r
+\r
+\r
+def _first_usable(page: Page, candidates: Sequence[str], *, root: Locator = None) -> Optional[Locator]:\r
+    base = root if root is not None else page\r
+    for sel in candidates:\r
+        try:\r
+            loc = base.locator(sel)\r
+            count = loc.count()\r
+        except PWError:\r
+            continue\r
+        for i in range(min(count, 25)):\r
+            item = loc.nth(i)\r
+            try:\r
+                if item.is_visible():\r
+                    return item\r
+            except PWError:\r
+                continue\r
+        # Fall back to first match even if visibility check failed.\r
+        try:\r
+            if count > 0:\r
+                return loc.first\r
+        except PWError:\r
+            continue\r
+    return None\r
+\r
+\r
+def _all_visible(page: Page, candidates: Sequence[str], *, root: Locator = None) -> List[Locator]:\r
+    base = root if root is not None else page\r
+    for sel in candidates:\r
+        try:\r
+            loc = base.locator(sel)\r
+            count = loc.count()\r
+        except PWError:\r
+            continue\r
+        if count <= 0:\r
+            continue\r
+        items: List[Locator] = []\r
+        for i in range(count):\r
+            item = loc.nth(i)\r
+            try:\r
+                if item.is_visible():\r
+                    items.append(item)\r
+            except PWError:\r
+                continue\r
+        if items:\r
+            return items\r
+    return []\r
+\r
+\r
+def is_logged_in(page: Page) -> bool:\r
+    """DOM-first auth check against the notes app shell."""\r
+    for sel in SELECTORS["app_ready"]:\r
+        try:\r
+            loc = page.locator(sel)\r
+            if loc.count() > 0 and loc.first.is_visible():\r
+                return True\r
+        except PWError:\r
+            continue\r
+\r
+    url = (page.url or "").lower()\r
+    if any(marker in url for marker in config.SIGNIN_URL_MARKERS):\r
+        return False\r
+    try:\r
+        host = (urlparse(page.url or "").hostname or "").lower()\r
+    except Exception:\r
+        host = ""\r
+    if host in config.ALLOWED_HOSTS and "/notes" in url:\r
+        # URL alone is weak; require at least one app_ready attempt already failed.\r
+        return False\r
+    return False\r
+\r
+\r
+def _note_id_from_url(url: str) -> str:\r
+    m = _ID_FROM_URL.search(url or "")\r
+    if not m:\r
+        return ""\r
+    return m.group(1) or m.group(2) or ""\r
+\r
+\r
+def _clean(text: str) -> str:\r
+    return re.sub(r"\\s+", " ", (text or "")).strip()\r
+\r
+\r
+def _is_nav_title(title: str) -> bool:\r
+    return _clean(title).lower() in NAV_DENYLIST\r
+\r
+\r
+def _looks_like_note_row(title: str, host: str, date: str, lines: Sequence[str]) -> bool:\r
+    if _is_nav_title(title):\r
+        return False\r
+    if host:\r
+        return True\r
+    if date and len(lines) >= 2:\r
+        return True\r
+    # Single-line chrome labels are not notes.\r
+    if len(lines) <= 1:\r
+        return False\r
+    return True\r
+\r
+\r
+def wait_for_notes(page: Page, timeout_ms: int = None) -> bool:\r
+    """Wait until note rows render. Returns False on timeout."""\r
+    timeout_ms = timeout_ms or config.ACTION_TIMEOUT_MS\r
+    for sel in SELECTORS["note_items"]:\r
+        try:\r
+            page.wait_for_selector(sel, timeout=timeout_ms, state="visible")\r
+            return True\r
+        except (PWTimeoutError, PWError):\r
+            continue\r
+    return False\r
+\r
+\r
+def _parse_row_text(raw: str) -> tuple[str, str, str, List[str]]:\r
+    lines = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]\r
+    if not lines:\r
+        return "", "", "", []\r
+    title = lines[0][:200]\r
+    date = ""\r
+    host = ""\r
+    for ln in lines[1:]:\r
+        if ln.lower().startswith("host:"):\r
+            host = ln.split(":", 1)[1].strip()\r
+        elif not date:\r
+            date = ln\r
+    return title, host, date, lines\r
+\r
+\r
+def list_notes(page: Page, max_items: int) -> List[NoteRef]:\r
+    """Return up to max_items meeting notes from the list (newest-first)."""\r
+    wait_for_notes(page)\r
+    items = _all_visible(page, SELECTORS["note_items"])\r
+    notes: List[NoteRef] = []\r
+    if not items:\r
+        return notes\r
+\r
+    for i, row in enumerate(items):\r
+        if len(notes) >= max_items:\r
+            break\r
+        try:\r
+            raw = row.inner_text(timeout=config.ACTION_TIMEOUT_MS)\r
+        except PWTimeoutError:\r
+            continue\r
+        title, host, date, lines = _parse_row_text(raw)\r
+        if not title:\r
+            continue\r
+        if not _looks_like_note_row(title, host, date, lines):\r
+            continue\r
+        notes.append(\r
+            NoteRef(\r
+                index=i,\r
+                title=title,\r
+                host=host,\r
+                date=date,\r
+                raw_text=raw,\r
+            )\r
+        )\r
+    return notes\r
+\r
+\r
+def scroll_notes_list(page: Page) -> bool:\r
+    """Scroll the notes list to load more rows. Returns True if scroll ran."""\r
+    items = _all_visible(page, SELECTORS["note_items"])\r
+    if not items:\r
+        return False\r
+    try:\r
+        items[-1].scroll_into_view_if_needed(timeout=config.ACTION_TIMEOUT_MS)\r
+        page.wait_for_timeout(800)\r
+        page.mouse.wheel(0, 1200)\r
+        page.wait_for_timeout(800)\r
+        return True\r
+    except PWError:\r
+        return False\r
+\r
+\r
+def collect_notes(page: Page, max_items: int, max_scroll_steps: int = None) -> List[NoteRef]:\r
+    """Collect notes with limited scrolling (dedupe by metadata id)."""\r
+    max_scroll_steps = config.MAX_SCROLL_STEPS if max_scroll_steps is None else max_scroll_steps\r
+    seen: Set[str] = set()\r
+    collected: List[NoteRef] = []\r
+    stagnant = 0\r
+\r
+    for step in range(max_scroll_steps + 1):\r
+        batch = list_notes(page, max_items=max(max_items * 3, 50))\r
+        grew = 0\r
+        for note in batch:\r
+            mid = note.metadata_id()\r
+            if mid in seen:\r
+                continue\r
+            seen.add(mid)\r
+            collected.append(note)\r
+            grew += 1\r
+            if len(collected) >= max_items * 3:\r
+                break\r
+        if len(collected) >= max_items and grew == 0:\r
+            stagnant += 1\r
+        else:\r
+            stagnant = 0 if grew else stagnant + 1\r
+        if stagnant >= 2:\r
+            break\r
+        if step >= max_scroll_steps:\r
+            break\r
+        if not scroll_notes_list(page):\r
+            break\r
+    return collected[: max(max_items * 3, len(collected))]\r
+\r
+\r
+def _normalize(s: str) -> str:\r
+    return re.sub(r"\\s+", " ", (s or "")).strip().lower()\r
+\r
+\r
+def open_note(page: Page, note: NoteRef) -> None:\r
+    """Click the note row matching metadata and verify the note view loaded."""\r
+    items = _all_visible(page, SELECTORS["note_items"])\r
+    if not items:\r
+        raise RuntimeError("Note list disappeared before opening a note")\r
+\r
+    target: Optional[Locator] = None\r
+    # Prefer exact raw-text / title match over stale positional index.\r
+    want_title = _normalize(note.title)\r
+    for row in items:\r
+        try:\r
+            raw = row.inner_text(timeout=3000)\r
+        except PWError:\r
+            continue\r
+        title, host, date, _lines = _parse_row_text(raw)\r
+        if _normalize(title) == want_title:\r
+            if note.host and host and _normalize(host) != _normalize(note.host):\r
+                continue\r
+            target = row\r
+            break\r
+    if target is None and 0 <= note.index < len(items):\r
+        target = items[note.index]\r
+    if target is None:\r
+        raise RuntimeError(f"Could not locate note row for {note.title!r}")\r
+\r
+    target.click(timeout=config.ACTION_TIMEOUT_MS)\r
+    # Client-side view swap; wait for note body/title (not just shell chrome).\r
+    page.wait_for_timeout(2500)\r
+    _wait_opened(page, note)\r
+    note.url = page.url\r
+    note.note_id = _note_id_from_url(page.url)\r
+\r
+\r
+def _titles_compatible(want: str, shown: str) -> bool:\r
+    """True if opened title reasonably matches the list-row title."""\r
+    w = _normalize(want)\r
+    s = _normalize(shown)\r
+    if not w or not s:\r
+        return True  # cannot verify\r
+    if w == s:\r
+        return True\r
+    # UI may truncate, append date, or include extra whitespace/punctuation.\r
+    w40, s40 = w[:40], s[:40]\r
+    if w40 and (w40 in s or s40 in w):\r
+        return True\r
+    # Token overlap: at least half of significant tokens from want appear in shown.\r
+    w_tokens = [t for t in re.split(r"[^a-z0-9]+", w) if len(t) > 2]\r
+    if not w_tokens:\r
+        return True\r
+    hits = sum(1 for t in w_tokens if t in s)\r
+    return hits >= max(1, (len(w_tokens) + 1) // 2)\r
+\r
+\r
+def _is_chrome_title(text: str) -> bool:\r
+    t = _normalize(text)\r
+    if not t:\r
+        return True\r
+    if t in OPENED_TITLE_DENYLIST or t in NAV_DENYLIST:\r
+        return True\r
+    # Very short generic labels are almost never meeting titles.\r
+    if len(t) < 4:\r
+        return True\r
+    return False\r
+\r
+\r
+def _read_opened_title(page: Page) -> str:\r
+    """Return the best candidate meeting title from the opened note view."""\r
+    for sel in SELECTORS["opened_title"]:\r
+        try:\r
+            loc = page.locator(sel)\r
+            count = min(loc.count(), 10)\r
+        except PWError:\r
+            continue\r
+        for i in range(count):\r
+            try:\r
+                item = loc.nth(i)\r
+                if not item.is_visible():\r
+                    continue\r
+                text = _clean(item.inner_text(timeout=1500))\r
+            except PWError:\r
+                continue\r
+            if _is_chrome_title(text):\r
+                continue\r
+            return text\r
+    return ""\r
+\r
+\r
+def _page_shows_title(page: Page, title: str) -> bool:\r
+    """True if the expected meeting title is visible somewhere on the page."""\r
+    want = _clean(title)\r
+    if not want:\r
+        return False\r
+    # Try progressively shorter prefixes (UI may truncate).\r
+    candidates = [want, want[:80], want[:60], want[:40]]\r
+    seen = set()\r
+    for c in candidates:\r
+        c = c.strip()\r
+        if len(c) < 12 or c in seen:\r
+            continue\r
+        seen.add(c)\r
+        try:\r
+            loc = page.get_by_text(c, exact=False)\r
+            n = min(loc.count(), 8)\r
+            for i in range(n):\r
+                try:\r
+                    if loc.nth(i).is_visible():\r
+                        return True\r
+                except PWError:\r
+                    continue\r
+        except PWError:\r
+            continue\r
+    return False\r
+\r
+\r
+def _wait_opened(page: Page, note: NoteRef) -> None:\r
+    """Verify the note chrome rendered; hard-fail on clear title mismatch when enabled."""\r
+    # Note body/title often paints after the shell; give it a moment.\r
+    page.wait_for_timeout(800)\r
+\r
+    # Strongest signal: expected title text is visible (matches live Zoom layout).\r
+    if _page_shows_title(page, note.title):\r
+        return\r
+\r
+    kebab = _first_usable(page, SELECTORS["kebab"])\r
+    if kebab is None:\r
+        page.wait_for_timeout(1200)\r
+        kebab = _first_usable(page, SELECTORS["kebab"])\r
+        if _page_shows_title(page, note.title):\r
+            return\r
+\r
+    shown = _read_opened_title(page)\r
+\r
+    # Only enforce mismatch when we found a real title candidate (not UI chrome).\r
+    if shown and not _is_chrome_title(shown) and not _titles_compatible(note.title, shown):\r
+        if config.STRICT_OPEN_VERIFY:\r
+            raise OpenMismatchError(\r
+                f"opened title {shown!r} does not match expected {note.title!r}"\r
+            )\r
+\r
+    if kebab is None and not shown and not _page_shows_title(page, note.title):\r
+        # Still proceed; copy-page-content will report selector issues.\r
+        page.wait_for_timeout(500)\r
+\r
+\r
+def _menu_item_labels(page: Page) -> List[str]:\r
+    """Collect visible menu/list item labels for diagnostics."""\r
+    labels: List[str] = []\r
+    try:\r
+        loc = page.get_by_role("menuitem")\r
+        count = min(loc.count(), 40)\r
+        for i in range(count):\r
+            try:\r
+                item = loc.nth(i)\r
+                if not item.is_visible():\r
+                    continue\r
+                text = _clean(item.inner_text(timeout=500))\r
+            except PWError:\r
+                continue\r
+            if text and text not in labels and len(text) < 120:\r
+                labels.append(text)\r
+    except PWError:\r
+        pass\r
+    return labels\r
+\r
+\r
+def _click_timeout_ms() -> int:\r
+    return min(5000, int(config.ACTION_TIMEOUT_MS))\r
+\r
+\r
+def _safe_click(locator: Locator, *, timeout_ms: int = None) -> Optional[str]:\r
+    """Click a locator; return None on success or an error string."""\r
+    timeout_ms = timeout_ms if timeout_ms is not None else _click_timeout_ms()\r
+    try:\r
+        locator.scroll_into_view_if_needed(timeout=timeout_ms)\r
+    except PWError:\r
+        pass\r
+    try:\r
+        locator.click(timeout=timeout_ms, force=False)\r
+        return None\r
+    except PWError:\r
+        pass\r
+    try:\r
+        locator.click(timeout=timeout_ms, force=True)\r
+        return None\r
+    except PWError as exc:\r
+        return str(exc)[:240]\r
+\r
+\r
+def _menuitem_by_name(page: Page, pattern: re.Pattern[str]) -> Optional[Locator]:\r
+    """Return a stable role=menuitem locator matched by accessible name."""\r
+    try:\r
+        loc = page.get_by_role("menuitem", name=pattern)\r
+        if loc.count() <= 0:\r
+            return None\r
+        first = loc.first\r
+        if first.is_visible():\r
+            return first\r
+    except PWError:\r
+        return None\r
+    return None\r
+\r
+\r
+def _all_kebabs(page: Page) -> List[Locator]:\r
+    """Return distinct visible \u22EE / More buttons; top-right preferred."""\r
+    found: List[Locator] = []\r
+    seen: Set[str] = set()\r
+    for sel in SELECTORS["kebab"]:\r
+        try:\r
+            loc = page.locator(sel)\r
+            count = min(loc.count(), 12)\r
+        except PWError:\r
+            continue\r
+        for i in range(count):\r
+            try:\r
+                item = loc.nth(i)\r
+                if not item.is_visible():\r
+                    continue\r
+                box = item.bounding_box()\r
+                key = (\r
+                    f"{int(box['x'])}:{int(box['y'])}"\r
+                    if box\r
+                    else f"{sel}:{i}"\r
+                )\r
+            except PWError:\r
+                continue\r
+            if key in seen:\r
+                continue\r
+            seen.add(key)\r
+            found.append(item)\r
+\r
+    def _sort_key(el: Locator) -> tuple:\r
+        # Prefer upper-right chrome (page options), not sidebar.\r
+        try:\r
+            box = el.bounding_box() or {"x": 0, "y": 9999}\r
+            return (float(box.get("y", 9999)), -float(box.get("x", 0)))\r
+        except PWError:\r
+            return (9999.0, 0.0)\r
+\r
+    found.sort(key=_sort_key)\r
+    return found\r
+\r
+\r
+def _write_text_download(dest: Path, text: str) -> DownloadResult:\r
+    body = (text or "").strip()\r
+    if len(body) < 20:\r
+        return DownloadResult(DownloadOutcome.ABSENT, error="copied page content too short")\r
+    dest.parent.mkdir(parents=True, exist_ok=True)\r
+    part = dest.with_suffix(dest.suffix + ".part")\r
+    data = (body + "\\n").encode("utf-8")\r
+    part.write_bytes(data)\r
+    digest = hashlib.sha256(data).hexdigest()\r
+    part.replace(dest)\r
+    return DownloadResult(\r
+        DownloadOutcome.DOWNLOADED,\r
+        path=dest,\r
+        size=len(data),\r
+        sha256=digest,\r
+    )\r
+\r
+\r
+def _clear_clipboard(page: Page) -> None:\r
+    try:\r
+        page.evaluate(\r
+            """async () => {\r
+                try { await navigator.clipboard.writeText(''); } catch (e) {}\r
+            }"""\r
+        )\r
+    except PWError:\r
+        pass\r
+\r
+\r
+def _read_clipboard(page: Page) -> str:\r
+    """Read text from the system clipboard via the page context."""\r
+    try:\r
+        text = page.evaluate(\r
+            """async () => {\r
+                try {\r
+                    return await navigator.clipboard.readText();\r
+                } catch (e) {\r
+                    return '';\r
+                }\r
+            }"""\r
+        )\r
+        if isinstance(text, str) and text.strip():\r
+            return text\r
+    except PWError:\r
+        pass\r
+    return ""\r
+\r
+\r
+def _find_copy_page_content_item(page: Page) -> Optional[Locator]:\r
+    """Locate the Zoom 'Copy page content' menu item."""\r
+    patterns = (\r
+        re.compile(r"copy\\s+page\\s+content", re.I),\r
+        re.compile(r"copy\\s+content", re.I),\r
+        re.compile(r"copy\\s+page", re.I),\r
+    )\r
+    for pat in patterns:\r
+        item = _menuitem_by_name(page, pat)\r
+        if item is not None:\r
+            return item\r
+    item = _first_usable(page, SELECTORS["copy_page_content"])\r
+    if item is not None:\r
+        return item\r
+    # Last resort: any visible control whose text matches.\r
+    try:\r
+        loc = page.get_by_text(re.compile(r"copy\\s+page\\s+content", re.I))\r
+        if loc.count() > 0 and loc.first.is_visible():\r
+            return loc.first\r
+    except PWError:\r
+        pass\r
+    return None\r
+\r
+\r
+def _capture_summary_text(page: Page) -> tuple[str, str, str]:\r
+    """\u22EE \u2192 Copy page content \u2192 clipboard.\r
+\r
+    Returns (text, status, detail). status is one of:\r
+      "ok"              text captured\r
+      "selector_broken" page options (\u22EE) never found\r
+      "retryable"       menu/clipboard failed after retries\r
+    """\r
+    try:\r
+        page.context.grant_permissions(\r
+            ["clipboard-read", "clipboard-write"],\r
+            origin="https://docs.zoom.us",\r
+        )\r
+    except Exception:\r
+        pass\r
+\r
+    kebabs = _all_kebabs(page)\r
+    if not kebabs:\r
+        return "", "selector_broken", "page options (\u22EE) not found"\r
+\r
+    menu_labels_seen: List[str] = []\r
+    last_error = "Copy page content menu item missing"\r
+\r
+    for kebab in kebabs[:6]:\r
+        _dismiss_menu(page)\r
+        _clear_clipboard(page)\r
+\r
+        err = _safe_click(kebab)\r
+        if err:\r
+            last_error = f"\u22EE click failed: {err}"\r
+            continue\r
+\r
+        page.wait_for_timeout(700)\r
+        for lab in _menu_item_labels(page):\r
+            if lab not in menu_labels_seen:\r
+                menu_labels_seen.append(lab)\r
+\r
+        target = _find_copy_page_content_item(page)\r
+        if target is None:\r
+            last_error = "Copy page content menu item missing"\r
+            _dismiss_menu(page)\r
+            continue\r
+\r
+        click_err = _safe_click(target, timeout_ms=4000)\r
+        if click_err:\r
+            last_error = f"Copy page content click failed: {click_err}"\r
+            _dismiss_menu(page)\r
+            continue\r
+\r
+        # Clipboard write is async after the menu action.\r
+        text = ""\r
+        for _ in range(10):\r
+            page.wait_for_timeout(250)\r
+            text = _read_clipboard(page)\r
+            if text.strip():\r
+                break\r
+\r
+        _dismiss_menu(page)\r
+\r
+        if not text.strip():\r
+            last_error = "clipboard empty after Copy page content"\r
+            continue\r
+\r
+        return text, "ok", ""\r
+\r
+    detail = last_error\r
+    if menu_labels_seen:\r
+        detail = f"{last_error}; menu items: [{', '.join(menu_labels_seen[:12])}]"\r
+    return "", "retryable", detail\r
+\r
+\r
+def _is_disabled(locator: Locator) -> bool:\r
+    """True if a menu item is present but disabled/greyed out."""\r
+    try:\r
+        aria = locator.get_attribute("aria-disabled")\r
+        if aria and aria.strip().lower() in ("true", "1"):\r
+            return True\r
+    except PWError:\r
+        pass\r
+    try:\r
+        if locator.get_attribute("disabled") is not None:\r
+            return True\r
+    except PWError:\r
+        pass\r
+    try:\r
+        if not locator.is_enabled():\r
+            return True\r
+    except PWError:\r
+        pass\r
+    return False\r
+\r
+\r
+def _find_download_transcript_item(page: Page) -> Optional[Locator]:\r
+    """Locate the Zoom 'Download transcript' menu item."""\r
+    item = _menuitem_by_name(page, re.compile(r"download\\s+transcript", re.I))\r
+    if item is not None:\r
+        return item\r
+    return _first_usable(page, SELECTORS["download_transcript"])\r
+\r
+\r
+def _capture_raw_transcript(page: Page) -> tuple[str, str, str]:\r
+    """\u22EE \u2192 Download transcript \u2192 captured download file text.\r
+\r
+    Returns (text, status, detail). status is one of:\r
+      "ok"        transcript text captured\r
+      "absent"    the menu item is missing or greyed out (no transcript)\r
+      "retryable" the item was present but the download failed\r
+    """\r
+    kebabs = _all_kebabs(page)\r
+    if not kebabs:\r
+        return "", "absent", "page options (\u22EE) not found"\r
+\r
+    last_error = "Download transcript menu item missing"\r
+    saw_item = False\r
+\r
+    for kebab in kebabs[:6]:\r
+        _dismiss_menu(page)\r
+\r
+        err = _safe_click(kebab)\r
+        if err:\r
+            last_error = f"\u22EE click failed: {err}"\r
+            continue\r
+\r
+        page.wait_for_timeout(700)\r
+        target = _find_download_transcript_item(page)\r
+        if target is None:\r
+            last_error = "Download transcript menu item missing"\r
+            _dismiss_menu(page)\r
+            continue\r
+\r
+        saw_item = True\r
+        if _is_disabled(target):\r
+            last_error = "Download transcript disabled (no transcript for this note)"\r
+            _dismiss_menu(page)\r
+            return "", "absent", last_error\r
+\r
+        text = ""\r
+        try:\r
+            with page.expect_download(timeout=config.DOWNLOAD_TIMEOUT_MS) as dl_info:\r
+                click_err = _safe_click(target, timeout_ms=4000)\r
+                if click_err:\r
+                    raise PWError(click_err)\r
+            download = dl_info.value\r
+            tmp = config.DATA_DIR / f".transcript-{uuid.uuid4().hex}.tmp"\r
+            tmp.parent.mkdir(parents=True, exist_ok=True)\r
+            download.save_as(str(tmp))\r
+            try:\r
+                text = tmp.read_text(encoding="utf-8", errors="replace")\r
+            finally:\r
+                try:\r
+                    tmp.unlink()\r
+                except OSError:\r
+                    pass\r
+        except (PWTimeoutError, PWError) as exc:\r
+            last_error = f"Download transcript failed: {str(exc)[:200]}"\r
+            _dismiss_menu(page)\r
+            continue\r
+\r
+        _dismiss_menu(page)\r
+        if text.strip():\r
+            return text, "ok", ""\r
+        last_error = "downloaded transcript was empty"\r
+\r
+    status = "retryable" if saw_item else "absent"\r
+    return "", status, last_error\r
+\r
+\r
+def _compose_markdown(summary: str, transcript: str) -> str:\r
+    """Summary on top; raw transcript appended under a heading when present."""\r
+    body = (summary or "").strip()\r
+    tx = (transcript or "").strip()\r
+    if tx:\r
+        body = f"{body}\\n\\n---\\n\\n## Raw transcript\\n\\n{tx}"\r
+    return body\r
+\r
+\r
+def _extract_transcript_from_page(page: Page) -> str:\r
+    """Fallback: scrape main note body if clipboard copy fails."""\r
+    container_sels = [\r
+        "article",\r
+        '[role="article"]',\r
+        "main",\r
+        '[role="main"]',\r
+        '[contenteditable="true"]',\r
+    ]\r
+    best = ""\r
+    for sel in container_sels:\r
+        try:\r
+            loc = page.locator(sel)\r
+            count = min(loc.count(), 8)\r
+        except PWError:\r
+            continue\r
+        for i in range(count):\r
+            try:\r
+                item = loc.nth(i)\r
+                if not item.is_visible():\r
+                    continue\r
+                text = (item.inner_text(timeout=2500) or "").strip()\r
+            except PWError:\r
+                continue\r
+            if len(text) > len(best):\r
+                best = text\r
+        if len(best) > 400:\r
+            break\r
+    return best\r
+\r
+\r
+def download_transcript(page: Page, dest: Path) -> DownloadResult:\r
+    """Capture a note as one .md: summary (Copy page content) + raw transcript.\r
+\r
+    Kept name for sync.py compatibility. The summary is captured first, then the\r
+    raw transcript via the 'Download transcript' menu item (when available) is\r
+    appended at the bottom under a heading.\r
+    """\r
+    summary, s_status, s_detail = _capture_summary_text(page)\r
+\r
+    if not summary.strip():\r
+        # Fallback scrape of the open note body.\r
+        scraped = _extract_transcript_from_page(page)\r
+        if scraped and len(scraped.strip()) >= 40:\r
+            summary = scraped\r
+            s_status = "ok"\r
+\r
+    if not summary.strip():\r
+        save_diagnostics(page, f"copy-fail-{dest.stem[:40]}")\r
+        outcome = (\r
+            DownloadOutcome.SELECTOR_BROKEN\r
+            if s_status == "selector_broken"\r
+            else DownloadOutcome.RETRYABLE\r
+        )\r
+        return DownloadResult(outcome, error=s_detail or "summary capture failed")\r
+\r
+    transcript, t_status, _t_detail = _capture_raw_transcript(page)\r
+\r
+    body = _compose_markdown(summary, transcript)\r
+    result = _write_text_download(dest, body)\r
+    result.has_transcript = bool(transcript.strip()) and t_status == "ok"\r
+    return result\r
+\r
+\r
+def _dismiss_menu(page: Page) -> None:\r
+    try:\r
+        page.keyboard.press("Escape")\r
+        page.wait_for_timeout(300)\r
+        # Second escape helps nested overlays.\r
+        page.keyboard.press("Escape")\r
+        page.wait_for_timeout(200)\r
+    except PWError:\r
+        pass\r
+\r
+\r
+def save_diagnostics(page: Page, label: str) -> Optional[Path]:\r
+    """Best-effort screenshot for selector failures."""\r
+    try:\r
+        config.DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)\r
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", label)[:60] or "diag"\r
+        path = config.DIAGNOSTICS_DIR / f"{safe}.png"\r
+        page.screenshot(path=str(path), full_page=False)\r
+        return path\r
+    except Exception:\r
+        return None\r
 `,
-  "index_store.py": `"""Persistent index of downloaded transcripts, used for deduplication.
-
-The index is a single JSON file mapping a stable note id to a record. Both
-successfully downloaded notes and notes that have no transcript are recorded.
-Absent transcripts use a backoff schedule so they are rechecked later.
-
-Schema is additive: existing v1 records (no version field) remain readable.
-Corrupt indexes are quarantined and never silently replaced with an empty file.
-"""
-
-from __future__ import annotations
-
-import json
-import shutil
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
-
-STATUS_DOWNLOADED = "downloaded"
-STATUS_NO_TRANSCRIPT = "no_transcript"
-STATUS_MISSING_FILE = "missing_file"
-STATUS_RETRYABLE = "retryable"
-
-INDEX_VERSION = 2
-
-
-class IndexCorruptError(Exception):
-    """Raised when the on-disk index cannot be loaded safely."""
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc).astimezone()
-
-
-def _now_iso() -> str:
-    return _now().isoformat(timespec="seconds")
-
-
-def _parse_iso(value: str) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-
-@dataclass
-class IndexStore:
-    path: Path
-    _data: Dict[str, Any] = field(default_factory=dict)
-    backoff_hours: Sequence[int] = field(default_factory=lambda: (6, 24, 72, 168))
-
-    def __post_init__(self) -> None:
-        if not self._data:
-            self._data = self._empty()
-
-    @staticmethod
-    def _empty() -> Dict[str, Any]:
-        return {
-            "version": INDEX_VERSION,
-            "transcripts": {},
-            "scan": {},
-            "meta": {},
-        }
-
-    @classmethod
-    def load(cls, path: Path, *, backoff_hours: Sequence[int] = (6, 24, 72, 168)) -> "IndexStore":
-        store = cls(path=path, backoff_hours=tuple(backoff_hours))
-        if not path.exists():
-            return store
-        try:
-            raw = path.read_text(encoding="utf-8")
-            loaded = json.loads(raw)
-        except (json.JSONDecodeError, OSError, UnicodeError) as exc:
-            quarantine = path.with_name(
-                f"{path.name}.corrupt-{_now().strftime('%Y%m%d%H%M%S')}"
-            )
-            try:
-                shutil.copy2(path, quarantine)
-            except OSError:
-                quarantine = None
-            detail = f"quarantined to {quarantine}" if quarantine else "could not quarantine"
-            raise IndexCorruptError(f"Unreadable index at {path} ({detail}): {exc}") from exc
-
-        if not isinstance(loaded, dict) or not isinstance(loaded.get("transcripts"), dict):
-            quarantine = path.with_name(
-                f"{path.name}.corrupt-{_now().strftime('%Y%m%d%H%M%S')}"
-            )
-            try:
-                shutil.copy2(path, quarantine)
-            except OSError:
-                pass
-            raise IndexCorruptError(f"Malformed index structure at {path}")
-
-        # Preserve all existing fields; fill additive defaults.
-        store._data = loaded
-        store._data.setdefault("version", 1)
-        store._data.setdefault("scan", {})
-        store._data.setdefault("meta", {})
-        if not isinstance(store._data["scan"], dict):
-            store._data["scan"] = {}
-        if not isinstance(store._data["meta"], dict):
-            store._data["meta"] = {}
-        return store
-
-    @property
-    def transcripts(self) -> Dict[str, Any]:
-        return self._data["transcripts"]
-
-    def has(self, note_id: str) -> bool:
-        return self.resolve_id(note_id) is not None
-
-    def resolve_id(self, note_id: str) -> Optional[str]:
-        """Return the canonical key for note_id or one of its aliases."""
-        if note_id in self.transcripts:
-            return note_id
-        for key, rec in self.transcripts.items():
-            aliases = rec.get("aliases") or []
-            if isinstance(aliases, list) and note_id in aliases:
-                return key
-        return None
-
-    def get(self, note_id: str) -> Optional[Dict[str, Any]]:
-        key = self.resolve_id(note_id)
-        if key is None:
-            return None
-        return self.transcripts.get(key)
-
-    def requeue_false_absents(self) -> int:
-        """Re-open notes wrongly marked absent due to UI/menu selector misses."""
-        markers = (
-            "download menu item missing",
-            "copy page content",
-            "clipboard empty",
-            "menu items:",
-            "kebab not found",
-            "page options",
-            "download/click timeout",
-            "download timeout",
-            "locator.click",
-            "requeued for selector",
-        )
-        count = 0
-        for key, rec in list(self.transcripts.items()):
-            if rec.get("status") != STATUS_NO_TRANSCRIPT:
-                continue
-            err = str(rec.get("last_error") or "").lower()
-            if not any(m in err for m in markers):
-                # Also requeue absents with empty error (older runs).
-                if err.strip():
-                    continue
-            rec = dict(rec)
-            rec["status"] = STATUS_RETRYABLE
-            rec["next_retry"] = ""
-            rec["last_outcome"] = "requeued_false_absent"
-            rec["last_error"] = "requeued for selector refresh"
-            self.transcripts[key] = rec
-            count += 1
-        if count:
-            self.save()
-        return count
-
-    def should_process(self, note_id: str, *, now: datetime = None) -> bool:
-        """True if this note should be opened/checked on this run."""
-        now = now or _now()
-        rec = self.get(note_id)
-        if rec is None:
-            return True
-        status = rec.get("status")
-        if status == STATUS_DOWNLOADED:
-            file_rel = rec.get("file") or ""
-            if file_rel:
-                # Caller may still reconcile; treat as skip if marked downloaded.
-                return False
-            return True
-        if status == STATUS_MISSING_FILE:
-            return True
-        if status == STATUS_RETRYABLE:
-            return self._is_due(rec, now)
-        if status == STATUS_NO_TRANSCRIPT:
-            return self._is_due(rec, now)
-        return True
-
-    def _is_due(self, rec: Dict[str, Any], now: datetime) -> bool:
-        nxt = _parse_iso(str(rec.get("next_retry") or ""))
-        if nxt is None:
-            return True
-        # Compare timezone-aware when possible.
-        if nxt.tzinfo is None:
-            nxt = nxt.replace(tzinfo=now.tzinfo)
-        return now >= nxt
-
-    def _backoff_delta(self, attempts: int) -> timedelta:
-        hours = list(self.backoff_hours) or [6, 24, 72, 168]
-        idx = max(0, min(attempts - 1, len(hours) - 1))
-        if attempts <= 0:
-            idx = 0
-        return timedelta(hours=int(hours[idx]))
-
-    def add(
-        self,
-        note_id: str,
-        *,
-        title: str,
-        status: str,
-        source_url: str = "",
-        host: str = "",
-        meeting_date: str = "",
-        file: str = "",
-        aliases: Optional[Iterable[str]] = None,
-        size: Optional[int] = None,
-        sha256: str = "",
-        last_outcome: str = "",
-        last_error: str = "",
-    ) -> None:
-        existing_key = self.resolve_id(note_id)
-        key = existing_key or note_id
-        prev = dict(self.transcripts.get(key) or {})
-
-        alias_set = set(prev.get("aliases") or [])
-        if aliases:
-            alias_set.update(a for a in aliases if a and a != key)
-        if existing_key and note_id != existing_key:
-            alias_set.add(note_id)
-        # If we previously knew this under another hash only, keep it.
-
-        attempts = int(prev.get("attempts") or 0)
-        if status in (STATUS_NO_TRANSCRIPT, STATUS_RETRYABLE, STATUS_MISSING_FILE):
-            attempts += 1
-        elif status == STATUS_DOWNLOADED:
-            attempts = int(prev.get("attempts") or 0)
-
-        now = _now()
-        next_retry = ""
-        if status in (STATUS_NO_TRANSCRIPT, STATUS_RETRYABLE, STATUS_MISSING_FILE):
-            next_retry = (now + self._backoff_delta(max(attempts, 1))).isoformat(timespec="seconds")
-
-        if file:
-            file_val = file
-        elif status == STATUS_DOWNLOADED:
-            file_val = prev.get("file") or ""
-        else:
-            file_val = ""
-
-        rec = {
-            "id": key,
-            "title": title or prev.get("title") or "",
-            "host": host if host != "" else prev.get("host") or "",
-            "meeting_date": meeting_date if meeting_date != "" else prev.get("meeting_date") or "",
-            "source_url": source_url if source_url != "" else prev.get("source_url") or "",
-            "status": status,
-            "file": file_val,
-            "recorded_at": prev.get("recorded_at") or _now_iso(),
-            "updated_at": _now_iso(),
-            "attempts": attempts,
-            "last_checked": _now_iso(),
-            "next_retry": next_retry,
-            "last_outcome": last_outcome or status,
-            "last_error": last_error,
-            "aliases": sorted(alias_set),
-        }
-        if size is not None:
-            rec["size"] = size
-        elif "size" in prev:
-            rec["size"] = prev["size"]
-        if sha256:
-            rec["sha256"] = sha256
-        elif prev.get("sha256"):
-            rec["sha256"] = prev["sha256"]
-
-        if status == STATUS_DOWNLOADED:
-            rec["next_retry"] = ""
-            if file:
-                rec["file"] = file
-
-        self.transcripts[key] = rec
-        self.save()
-
-    def add_alias(self, canonical_id: str, alias: str) -> None:
-        if not alias or alias == canonical_id:
-            return
-        key = self.resolve_id(canonical_id) or canonical_id
-        rec = self.transcripts.get(key)
-        if not rec:
-            return
-        aliases = set(rec.get("aliases") or [])
-        aliases.add(alias)
-        rec["aliases"] = sorted(aliases)
-        self.save()
-
-    def mark_scan(self, **fields: Any) -> None:
-        scan = self._data.setdefault("scan", {})
-        if not isinstance(scan, dict):
-            scan = {}
-            self._data["scan"] = scan
-        scan.update(fields)
-        scan["updated_at"] = _now_iso()
-        self.save()
-
-    def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._data["version"] = max(int(self._data.get("version") or 1), INDEX_VERSION)
-        # Rolling backup of previous good file.
-        if self.path.exists():
-            bak = self.path.with_suffix(self.path.suffix + ".bak")
-            try:
-                shutil.copy2(self.path, bak)
-            except OSError:
-                pass
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(self._data, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.path)
-
-    def reconcile_files(self, base_dir: Path) -> List[str]:
-        """Mark downloaded records whose files are missing/empty. Returns ids."""
-        changed: List[str] = []
-        for key, rec in list(self.transcripts.items()):
-            if rec.get("status") != STATUS_DOWNLOADED:
-                continue
-            rel = rec.get("file") or ""
-            if not rel:
-                rec["status"] = STATUS_MISSING_FILE
-                rec["next_retry"] = _now_iso()
-                rec["last_outcome"] = "missing_file"
-                rec["updated_at"] = _now_iso()
-                changed.append(key)
-                continue
-            path = (base_dir / rel).resolve() if not Path(rel).is_absolute() else Path(rel)
-            try:
-                ok = path.is_file() and path.stat().st_size > 0
-            except OSError:
-                ok = False
-            if not ok:
-                rec["status"] = STATUS_MISSING_FILE
-                rec["next_retry"] = _now_iso()
-                rec["last_outcome"] = "missing_file"
-                rec["updated_at"] = _now_iso()
-                changed.append(key)
-        if changed:
-            self.save()
-        return changed
-
-    def find_orphan_files(self, transcripts_dir: Path, base_dir: Path) -> List[str]:
-        """Return transcript paths on disk not referenced by any index record.
-
-        Walks month subfolders under transcripts_dir. Returns paths relative to
-        transcripts_dir when possible (e.g. '2026-07/foo.md'). Never deletes;
-        caller logs only.
-        """
-        if not transcripts_dir.is_dir():
-            return []
-        referenced: set[str] = set()
-        for rec in self.transcripts.values():
-            rel = rec.get("file") or ""
-            if not rel:
-                continue
-            try:
-                path = (base_dir / rel).resolve() if not Path(rel).is_absolute() else Path(rel).resolve()
-                referenced.add(path.name.lower())
-            except OSError:
-                referenced.add(Path(rel).name.lower())
-        orphans: List[str] = []
-        root = transcripts_dir.resolve()
-        try:
-            for pattern in ("*.md", "*.txt"):
-                for path in transcripts_dir.rglob(pattern):
-                    if not path.is_file():
-                        continue
-                    if path.name.endswith(".part"):
-                        continue
-                    if path.name.lower() in referenced:
-                        continue
-                    try:
-                        orphans.append(str(path.resolve().relative_to(root)).replace("\\\\", "/"))
-                    except ValueError:
-                        orphans.append(path.name)
-        except OSError:
-            return []
-        return sorted(set(orphans))
-
-    def get_scan(self) -> Dict[str, Any]:
-        scan = self._data.get("scan") or {}
-        return scan if isinstance(scan, dict) else {}
-
-    def watermark_ids(self) -> List[str]:
-        scan = self.get_scan()
-        ids = scan.get("watermark_ids") or []
-        return [str(x) for x in ids] if isinstance(ids, list) else []
-
-    @property
-    def count(self) -> int:
-        return len(self.transcripts)
-
-    def status_counts(self) -> Dict[str, int]:
-        counts: Dict[str, int] = {}
-        for rec in self.transcripts.values():
-            st = str(rec.get("status") or "unknown")
-            counts[st] = counts.get(st, 0) + 1
-        return counts
+  "index_store.py": `"""Persistent index of downloaded transcripts, used for deduplication.\r
+\r
+The index is a single JSON file mapping a stable note id to a record. Both\r
+successfully downloaded notes and notes that have no transcript are recorded.\r
+Absent transcripts use a backoff schedule so they are rechecked later.\r
+\r
+Schema is additive: existing v1 records (no version field) remain readable.\r
+Corrupt indexes are quarantined and never silently replaced with an empty file.\r
+"""\r
+\r
+from __future__ import annotations\r
+\r
+import json\r
+import shutil\r
+from dataclasses import dataclass, field\r
+from datetime import datetime, timedelta, timezone\r
+from pathlib import Path\r
+from typing import Any, Dict, Iterable, List, Optional, Sequence\r
+\r
+STATUS_DOWNLOADED = "downloaded"\r
+STATUS_NO_TRANSCRIPT = "no_transcript"\r
+STATUS_MISSING_FILE = "missing_file"\r
+STATUS_RETRYABLE = "retryable"\r
+\r
+INDEX_VERSION = 2\r
+\r
+# Bumped whenever the saved note layout changes. Downloaded records below this\r
+# are re-queued once so they are regenerated with the newest layout (e.g. the\r
+# raw transcript appended at the bottom).\r
+CONTENT_VERSION = 2\r
+\r
+\r
+class IndexCorruptError(Exception):\r
+    """Raised when the on-disk index cannot be loaded safely."""\r
+\r
+\r
+def _now() -> datetime:\r
+    return datetime.now(timezone.utc).astimezone()\r
+\r
+\r
+def _now_iso() -> str:\r
+    return _now().isoformat(timespec="seconds")\r
+\r
+\r
+def _parse_iso(value: str) -> Optional[datetime]:\r
+    if not value:\r
+        return None\r
+    try:\r
+        return datetime.fromisoformat(value)\r
+    except ValueError:\r
+        return None\r
+\r
+\r
+@dataclass\r
+class IndexStore:\r
+    path: Path\r
+    _data: Dict[str, Any] = field(default_factory=dict)\r
+    backoff_hours: Sequence[int] = field(default_factory=lambda: (6, 24, 72, 168))\r
+\r
+    def __post_init__(self) -> None:\r
+        if not self._data:\r
+            self._data = self._empty()\r
+\r
+    @staticmethod\r
+    def _empty() -> Dict[str, Any]:\r
+        return {\r
+            "version": INDEX_VERSION,\r
+            "transcripts": {},\r
+            "scan": {},\r
+            "meta": {},\r
+        }\r
+\r
+    @classmethod\r
+    def load(cls, path: Path, *, backoff_hours: Sequence[int] = (6, 24, 72, 168)) -> "IndexStore":\r
+        store = cls(path=path, backoff_hours=tuple(backoff_hours))\r
+        if not path.exists():\r
+            return store\r
+        try:\r
+            raw = path.read_text(encoding="utf-8")\r
+            loaded = json.loads(raw)\r
+        except (json.JSONDecodeError, OSError, UnicodeError) as exc:\r
+            quarantine = path.with_name(\r
+                f"{path.name}.corrupt-{_now().strftime('%Y%m%d%H%M%S')}"\r
+            )\r
+            try:\r
+                shutil.copy2(path, quarantine)\r
+            except OSError:\r
+                quarantine = None\r
+            detail = f"quarantined to {quarantine}" if quarantine else "could not quarantine"\r
+            raise IndexCorruptError(f"Unreadable index at {path} ({detail}): {exc}") from exc\r
+\r
+        if not isinstance(loaded, dict) or not isinstance(loaded.get("transcripts"), dict):\r
+            quarantine = path.with_name(\r
+                f"{path.name}.corrupt-{_now().strftime('%Y%m%d%H%M%S')}"\r
+            )\r
+            try:\r
+                shutil.copy2(path, quarantine)\r
+            except OSError:\r
+                pass\r
+            raise IndexCorruptError(f"Malformed index structure at {path}")\r
+\r
+        # Preserve all existing fields; fill additive defaults.\r
+        store._data = loaded\r
+        store._data.setdefault("version", 1)\r
+        store._data.setdefault("scan", {})\r
+        store._data.setdefault("meta", {})\r
+        if not isinstance(store._data["scan"], dict):\r
+            store._data["scan"] = {}\r
+        if not isinstance(store._data["meta"], dict):\r
+            store._data["meta"] = {}\r
+        return store\r
+\r
+    @property\r
+    def transcripts(self) -> Dict[str, Any]:\r
+        return self._data["transcripts"]\r
+\r
+    def has(self, note_id: str) -> bool:\r
+        return self.resolve_id(note_id) is not None\r
+\r
+    def resolve_id(self, note_id: str) -> Optional[str]:\r
+        """Return the canonical key for note_id or one of its aliases."""\r
+        if note_id in self.transcripts:\r
+            return note_id\r
+        for key, rec in self.transcripts.items():\r
+            aliases = rec.get("aliases") or []\r
+            if isinstance(aliases, list) and note_id in aliases:\r
+                return key\r
+        return None\r
+\r
+    def get(self, note_id: str) -> Optional[Dict[str, Any]]:\r
+        key = self.resolve_id(note_id)\r
+        if key is None:\r
+            return None\r
+        return self.transcripts.get(key)\r
+\r
+    def requeue_false_absents(self) -> int:\r
+        """Re-open notes wrongly marked absent due to UI/menu selector misses."""\r
+        markers = (\r
+            "download menu item missing",\r
+            "copy page content",\r
+            "clipboard empty",\r
+            "menu items:",\r
+            "kebab not found",\r
+            "page options",\r
+            "download/click timeout",\r
+            "download timeout",\r
+            "locator.click",\r
+            "requeued for selector",\r
+        )\r
+        count = 0\r
+        for key, rec in list(self.transcripts.items()):\r
+            if rec.get("status") != STATUS_NO_TRANSCRIPT:\r
+                continue\r
+            err = str(rec.get("last_error") or "").lower()\r
+            if not any(m in err for m in markers):\r
+                # Also requeue absents with empty error (older runs).\r
+                if err.strip():\r
+                    continue\r
+            rec = dict(rec)\r
+            rec["status"] = STATUS_RETRYABLE\r
+            rec["next_retry"] = ""\r
+            rec["last_outcome"] = "requeued_false_absent"\r
+            rec["last_error"] = "requeued for selector refresh"\r
+            self.transcripts[key] = rec\r
+            count += 1\r
+        if count:\r
+            self.save()\r
+        return count\r
+\r
+    def requeue_pre_transcript(self) -> int:\r
+        """Re-queue downloaded notes saved before the transcript-append layout.\r
+\r
+        Records whose content_version is below CONTENT_VERSION are flipped to\r
+        retryable (due now) so they get re-opened once and regenerated with the\r
+        raw transcript appended. Reprocessing overwrites the same deterministic\r
+        filename, so no duplicate files are created.\r
+        """\r
+        count = 0\r
+        for key, rec in list(self.transcripts.items()):\r
+            if rec.get("status") != STATUS_DOWNLOADED:\r
+                continue\r
+            if int(rec.get("content_version") or 1) >= CONTENT_VERSION:\r
+                continue\r
+            rec = dict(rec)\r
+            rec["status"] = STATUS_RETRYABLE\r
+            rec["next_retry"] = ""\r
+            rec["last_outcome"] = "requeued_pre_transcript"\r
+            rec["last_error"] = "requeued to append raw transcript"\r
+            self.transcripts[key] = rec\r
+            count += 1\r
+        if count:\r
+            self.save()\r
+        return count\r
+\r
+    def should_process(self, note_id: str, *, now: datetime = None) -> bool:\r
+        """True if this note should be opened/checked on this run."""\r
+        now = now or _now()\r
+        rec = self.get(note_id)\r
+        if rec is None:\r
+            return True\r
+        status = rec.get("status")\r
+        if status == STATUS_DOWNLOADED:\r
+            file_rel = rec.get("file") or ""\r
+            if file_rel:\r
+                # Caller may still reconcile; treat as skip if marked downloaded.\r
+                return False\r
+            return True\r
+        if status == STATUS_MISSING_FILE:\r
+            return True\r
+        if status == STATUS_RETRYABLE:\r
+            return self._is_due(rec, now)\r
+        if status == STATUS_NO_TRANSCRIPT:\r
+            return self._is_due(rec, now)\r
+        return True\r
+\r
+    def _is_due(self, rec: Dict[str, Any], now: datetime) -> bool:\r
+        nxt = _parse_iso(str(rec.get("next_retry") or ""))\r
+        if nxt is None:\r
+            return True\r
+        # Compare timezone-aware when possible.\r
+        if nxt.tzinfo is None:\r
+            nxt = nxt.replace(tzinfo=now.tzinfo)\r
+        return now >= nxt\r
+\r
+    def _backoff_delta(self, attempts: int) -> timedelta:\r
+        hours = list(self.backoff_hours) or [6, 24, 72, 168]\r
+        idx = max(0, min(attempts - 1, len(hours) - 1))\r
+        if attempts <= 0:\r
+            idx = 0\r
+        return timedelta(hours=int(hours[idx]))\r
+\r
+    def add(\r
+        self,\r
+        note_id: str,\r
+        *,\r
+        title: str,\r
+        status: str,\r
+        source_url: str = "",\r
+        host: str = "",\r
+        meeting_date: str = "",\r
+        file: str = "",\r
+        aliases: Optional[Iterable[str]] = None,\r
+        size: Optional[int] = None,\r
+        sha256: str = "",\r
+        last_outcome: str = "",\r
+        last_error: str = "",\r
+        content_version: Optional[int] = None,\r
+        has_transcript: Optional[bool] = None,\r
+    ) -> None:\r
+        existing_key = self.resolve_id(note_id)\r
+        key = existing_key or note_id\r
+        prev = dict(self.transcripts.get(key) or {})\r
+\r
+        alias_set = set(prev.get("aliases") or [])\r
+        if aliases:\r
+            alias_set.update(a for a in aliases if a and a != key)\r
+        if existing_key and note_id != existing_key:\r
+            alias_set.add(note_id)\r
+        # If we previously knew this under another hash only, keep it.\r
+\r
+        attempts = int(prev.get("attempts") or 0)\r
+        if status in (STATUS_NO_TRANSCRIPT, STATUS_RETRYABLE, STATUS_MISSING_FILE):\r
+            attempts += 1\r
+        elif status == STATUS_DOWNLOADED:\r
+            attempts = int(prev.get("attempts") or 0)\r
+\r
+        now = _now()\r
+        next_retry = ""\r
+        if status in (STATUS_NO_TRANSCRIPT, STATUS_RETRYABLE, STATUS_MISSING_FILE):\r
+            next_retry = (now + self._backoff_delta(max(attempts, 1))).isoformat(timespec="seconds")\r
+\r
+        if file:\r
+            file_val = file\r
+        elif status == STATUS_DOWNLOADED:\r
+            file_val = prev.get("file") or ""\r
+        else:\r
+            file_val = ""\r
+\r
+        rec = {\r
+            "id": key,\r
+            "title": title or prev.get("title") or "",\r
+            "host": host if host != "" else prev.get("host") or "",\r
+            "meeting_date": meeting_date if meeting_date != "" else prev.get("meeting_date") or "",\r
+            "source_url": source_url if source_url != "" else prev.get("source_url") or "",\r
+            "status": status,\r
+            "file": file_val,\r
+            "recorded_at": prev.get("recorded_at") or _now_iso(),\r
+            "updated_at": _now_iso(),\r
+            "attempts": attempts,\r
+            "last_checked": _now_iso(),\r
+            "next_retry": next_retry,\r
+            "last_outcome": last_outcome or status,\r
+            "last_error": last_error,\r
+            "aliases": sorted(alias_set),\r
+        }\r
+        if size is not None:\r
+            rec["size"] = size\r
+        elif "size" in prev:\r
+            rec["size"] = prev["size"]\r
+        if sha256:\r
+            rec["sha256"] = sha256\r
+        elif prev.get("sha256"):\r
+            rec["sha256"] = prev["sha256"]\r
+\r
+        if content_version is not None:\r
+            rec["content_version"] = int(content_version)\r
+        elif "content_version" in prev:\r
+            rec["content_version"] = prev["content_version"]\r
+        if has_transcript is not None:\r
+            rec["has_transcript"] = bool(has_transcript)\r
+        elif "has_transcript" in prev:\r
+            rec["has_transcript"] = prev["has_transcript"]\r
+\r
+        if status == STATUS_DOWNLOADED:\r
+            rec["next_retry"] = ""\r
+            if file:\r
+                rec["file"] = file\r
+\r
+        self.transcripts[key] = rec\r
+        self.save()\r
+\r
+    def add_alias(self, canonical_id: str, alias: str) -> None:\r
+        if not alias or alias == canonical_id:\r
+            return\r
+        key = self.resolve_id(canonical_id) or canonical_id\r
+        rec = self.transcripts.get(key)\r
+        if not rec:\r
+            return\r
+        aliases = set(rec.get("aliases") or [])\r
+        aliases.add(alias)\r
+        rec["aliases"] = sorted(aliases)\r
+        self.save()\r
+\r
+    def mark_scan(self, **fields: Any) -> None:\r
+        scan = self._data.setdefault("scan", {})\r
+        if not isinstance(scan, dict):\r
+            scan = {}\r
+            self._data["scan"] = scan\r
+        scan.update(fields)\r
+        scan["updated_at"] = _now_iso()\r
+        self.save()\r
+\r
+    def save(self) -> None:\r
+        self.path.parent.mkdir(parents=True, exist_ok=True)\r
+        self._data["version"] = max(int(self._data.get("version") or 1), INDEX_VERSION)\r
+        # Rolling backup of previous good file.\r
+        if self.path.exists():\r
+            bak = self.path.with_suffix(self.path.suffix + ".bak")\r
+            try:\r
+                shutil.copy2(self.path, bak)\r
+            except OSError:\r
+                pass\r
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")\r
+        tmp.write_text(json.dumps(self._data, indent=2, ensure_ascii=False), encoding="utf-8")\r
+        tmp.replace(self.path)\r
+\r
+    def reconcile_files(self, base_dir: Path) -> List[str]:\r
+        """Mark downloaded records whose files are missing/empty. Returns ids."""\r
+        changed: List[str] = []\r
+        for key, rec in list(self.transcripts.items()):\r
+            if rec.get("status") != STATUS_DOWNLOADED:\r
+                continue\r
+            rel = rec.get("file") or ""\r
+            if not rel:\r
+                rec["status"] = STATUS_MISSING_FILE\r
+                rec["next_retry"] = _now_iso()\r
+                rec["last_outcome"] = "missing_file"\r
+                rec["updated_at"] = _now_iso()\r
+                changed.append(key)\r
+                continue\r
+            path = (base_dir / rel).resolve() if not Path(rel).is_absolute() else Path(rel)\r
+            try:\r
+                ok = path.is_file() and path.stat().st_size > 0\r
+            except OSError:\r
+                ok = False\r
+            if not ok:\r
+                rec["status"] = STATUS_MISSING_FILE\r
+                rec["next_retry"] = _now_iso()\r
+                rec["last_outcome"] = "missing_file"\r
+                rec["updated_at"] = _now_iso()\r
+                changed.append(key)\r
+        if changed:\r
+            self.save()\r
+        return changed\r
+\r
+    def find_orphan_files(self, transcripts_dir: Path, base_dir: Path) -> List[str]:\r
+        """Return transcript paths on disk not referenced by any index record.\r
+\r
+        Walks month subfolders under transcripts_dir. Returns paths relative to\r
+        transcripts_dir when possible (e.g. '2026-07/foo.md'). Never deletes;\r
+        caller logs only.\r
+        """\r
+        if not transcripts_dir.is_dir():\r
+            return []\r
+        referenced: set[str] = set()\r
+        for rec in self.transcripts.values():\r
+            rel = rec.get("file") or ""\r
+            if not rel:\r
+                continue\r
+            try:\r
+                path = (base_dir / rel).resolve() if not Path(rel).is_absolute() else Path(rel).resolve()\r
+                referenced.add(path.name.lower())\r
+            except OSError:\r
+                referenced.add(Path(rel).name.lower())\r
+        orphans: List[str] = []\r
+        root = transcripts_dir.resolve()\r
+        try:\r
+            for pattern in ("*.md", "*.txt"):\r
+                for path in transcripts_dir.rglob(pattern):\r
+                    if not path.is_file():\r
+                        continue\r
+                    if path.name.endswith(".part"):\r
+                        continue\r
+                    if path.name.lower() in referenced:\r
+                        continue\r
+                    try:\r
+                        orphans.append(str(path.resolve().relative_to(root)).replace("\\\\", "/"))\r
+                    except ValueError:\r
+                        orphans.append(path.name)\r
+        except OSError:\r
+            return []\r
+        return sorted(set(orphans))\r
+\r
+    def get_scan(self) -> Dict[str, Any]:\r
+        scan = self._data.get("scan") or {}\r
+        return scan if isinstance(scan, dict) else {}\r
+\r
+    def watermark_ids(self) -> List[str]:\r
+        scan = self.get_scan()\r
+        ids = scan.get("watermark_ids") or []\r
+        return [str(x) for x in ids] if isinstance(ids, list) else []\r
+\r
+    @property\r
+    def count(self) -> int:\r
+        return len(self.transcripts)\r
+\r
+    def status_counts(self) -> Dict[str, int]:\r
+        counts: Dict[str, int] = {}\r
+        for rec in self.transcripts.values():\r
+            st = str(rec.get("status") or "unknown")\r
+            counts[st] = counts.get(st, 0) + 1\r
+        return counts\r
 `,
-  "lockfile.py": '"""Atomic process lock with ownership token and heartbeat.\n\nUses O_CREAT|O_EXCL so two processes cannot both create the lock. The lock\npayload stores a random token, PID, and heartbeat timestamp. Release only\nsucceeds when the token still matches. Stale locks are reclaimed only when the\nheartbeat is old AND the owning PID is not alive (or not the original process).\n"""\n\nfrom __future__ import annotations\n\nimport json\nimport os\nimport time\nimport uuid\nfrom dataclasses import dataclass\nfrom datetime import datetime, timezone\nfrom pathlib import Path\nfrom typing import Any, Dict, Optional  # noqa: F401 \u2014 Dict used in helpers\n\n\ndef _now_iso() -> str:\n    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")\n\n\ndef _pid_alive(pid: int) -> bool:\n    if pid <= 0:\n        return False\n    if os.name == "nt":\n        try:\n            import ctypes\n\n            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000\n            STILL_ACTIVE = 259\n            handle = ctypes.windll.kernel32.OpenProcess(\n                PROCESS_QUERY_LIMITED_INFORMATION, False, pid\n            )\n            if not handle:\n                return False\n            try:\n                exit_code = ctypes.c_ulong()\n                if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)) == 0:\n                    return False\n                return exit_code.value == STILL_ACTIVE\n            finally:\n                ctypes.windll.kernel32.CloseHandle(handle)\n        except Exception:\n            return False\n    # POSIX\n    try:\n        os.kill(pid, 0)\n    except ProcessLookupError:\n        return False\n    except PermissionError:\n        return True\n    except OSError:\n        return False\n    return True\n\n\n@dataclass\nclass LockHandle:\n    path: Path\n    token: str\n    pid: int\n\n    def heartbeat(self) -> None:\n        data = _read(self.path)\n        if not data or data.get("token") != self.token:\n            return\n        data["heartbeat_at"] = _now_iso()\n        data["heartbeat_epoch"] = time.time()\n        _write_replace(self.path, data)\n\n    def release(self) -> bool:\n        data = _read(self.path)\n        if not data:\n            return False\n        if data.get("token") != self.token:\n            return False\n        try:\n            self.path.unlink(missing_ok=True)\n            return True\n        except OSError:\n            return False\n\n\ndef _read(path: Path) -> Optional[Dict[str, Any]]:\n    try:\n        if not path.exists():\n            return None\n        raw = path.read_text(encoding="utf-8")\n        data = json.loads(raw)\n        return data if isinstance(data, dict) else None\n    except (OSError, json.JSONDecodeError, UnicodeError):\n        return None\n\n\ndef _write_replace(path: Path, data: Dict[str, Any]) -> None:\n    tmp = path.with_suffix(path.suffix + ".tmp")\n    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")\n    tmp.replace(path)\n\n\ndef acquire(path: Path, stale_minutes: float = 25.0) -> Optional[LockHandle]:\n    """Try to acquire the lock. Returns a handle or None if held by a healthy peer."""\n    path.parent.mkdir(parents=True, exist_ok=True)\n    token = uuid.uuid4().hex\n    pid = os.getpid()\n    payload = {\n        "token": token,\n        "pid": pid,\n        "started_at": _now_iso(),\n        "heartbeat_at": _now_iso(),\n        "heartbeat_epoch": time.time(),\n    }\n\n    # Fast path: exclusive create.\n    try:\n        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)\n        try:\n            os.write(fd, json.dumps(payload, indent=2).encode("utf-8"))\n        finally:\n            os.close(fd)\n        return LockHandle(path=path, token=token, pid=pid)\n    except FileExistsError:\n        pass\n    except OSError:\n        return None\n\n    existing = _read(path)\n    if existing is None:\n        # Unreadable or empty; try reclaim by unlink + recreate.\n        try:\n            path.unlink(missing_ok=True)\n        except OSError:\n            return None\n        return acquire(path, stale_minutes=stale_minutes)\n\n    # Legacy plain-PID lock (old format was just a pid string).\n    if "token" not in existing:\n        try:\n            age_min = (time.time() - path.stat().st_mtime) / 60.0\n        except OSError:\n            age_min = stale_minutes + 1\n        legacy_pid = None\n        try:\n            legacy_pid = int(path.read_text(encoding="utf-8").strip())\n        except Exception:\n            legacy_pid = existing.get("pid")\n        if age_min < stale_minutes and legacy_pid and _pid_alive(int(legacy_pid)):\n            return None\n        try:\n            path.unlink(missing_ok=True)\n        except OSError:\n            return None\n        return acquire(path, stale_minutes=stale_minutes)\n\n    owner_pid = int(existing.get("pid") or 0)\n    heartbeat_epoch = existing.get("heartbeat_epoch")\n    if isinstance(heartbeat_epoch, (int, float)):\n        stale = (time.time() - float(heartbeat_epoch)) > (stale_minutes * 60.0)\n    else:\n        try:\n            stale = (time.time() - path.stat().st_mtime) > (stale_minutes * 60.0)\n        except OSError:\n            stale = True\n\n    if not stale and _pid_alive(owner_pid):\n        return None\n\n    # Stale or dead owner: reclaim.\n    try:\n        path.unlink(missing_ok=True)\n    except OSError:\n        return None\n    return acquire(path, stale_minutes=stale_minutes)\n',
-  "procs.py": `"""Process helpers for Playwright browser lifecycle on Windows.
-
-Headless Edge can hang on graceful close. Cleanup is scoped to a unique run
-token embedded in the browser launch user-data-dir / env so unrelated Edge or
-Playwright sessions are never killed.
-"""
-
-from __future__ import annotations
-
-import os
-import subprocess
-import threading
-from typing import Sequence
-
-_CREATE_NO_WINDOW = 0x08000000
-
-
-def kill_process_tree(pid: int, timeout: float = 30.0) -> None:
-    """Force-kill a process and its descendants (Windows taskkill /F /T)."""
-    if not pid or pid <= 0:
-        return
-    try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                capture_output=True,
-                timeout=timeout,
-                creationflags=_CREATE_NO_WINDOW,
-            )
-        else:
-            # Best-effort POSIX: kill process group if possible.
-            try:
-                os.killpg(pid, 9)
-            except Exception:
-                subprocess.run(["kill", "-9", str(pid)], capture_output=True, timeout=timeout)
-    except Exception:
-        pass
-
-
-def kill_by_command_token(
-    token: str,
-    process_names: Sequence[str],
-    timeout: float = 40.0,
-) -> None:
-    """Force-kill processes whose command line contains \`token\`.
-
-    \`token\` must be unique to this run (e.g. a UUID path segment). Never pass a
-    generic Playwright signature alone.
-    """
-    if not token or len(token) < 8:
-        return
-    names = [n for n in process_names if n]
-    if not names:
-        return
-
-    if os.name == "nt":
-        name_clauses = " -or ".join(f"$_.Name -eq '{n}'" for n in names)
-        safe_token = token.replace("'", "''")
-        ps = (
-            f"Get-CimInstance Win32_Process | Where-Object {{ "
-            f"({name_clauses}) -and ($_.CommandLine -like '*{safe_token}*') "
-            f"}} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force "
-            f"-ErrorAction SilentlyContinue }}"
-        )
-        try:
-            subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps],
-                capture_output=True,
-                timeout=timeout,
-                creationflags=_CREATE_NO_WINDOW,
-            )
-        except Exception:
-            pass
-        return
-
-    # macOS / Linux: pkill by token in the full command line (scoped).
-    try:
-        subprocess.run(
-            ["pkill", "-f", token],
-            capture_output=True,
-            timeout=timeout,
-        )
-    except Exception:
-        pass
-
-
-def stop_playwright(playwright, timeout: float = 10.0) -> None:
-    """Call playwright.stop() on the same logical wait, bounded by timeout.
-
-    Prefer calling this after browsers are already closed/killed. Uses a daemon
-    thread only as a last-resort timeout gate; the stop call itself may still
-    run in the background if it hangs.
-    """
-    if playwright is None:
-        return
-    done = threading.Event()
-
-    def _stop():
-        try:
-            playwright.stop()
-        except Exception:
-            pass
-        finally:
-            done.set()
-
-    threading.Thread(target=_stop, daemon=True).start()
-    done.wait(timeout)
-
-
-def close_context(context, timeout: float = 5.0) -> None:
-    if context is None:
-        return
-    done = threading.Event()
-
-    def _close():
-        try:
-            context.close()
-        except Exception:
-            pass
-        finally:
-            done.set()
-
-    threading.Thread(target=_close, daemon=True).start()
-    done.wait(timeout)
-
-
-def close_browser(browser, timeout: float = 5.0) -> None:
-    if browser is None:
-        return
-    done = threading.Event()
-
-    def _close():
-        try:
-            browser.close()
-        except Exception:
-            pass
-        finally:
-            done.set()
-
-    threading.Thread(target=_close, daemon=True).start()
-    done.wait(timeout)
-
-
-class BrowserSession:
-    """Owns one Playwright driver + browser + context for a single run phase."""
-
-    def __init__(
-        self,
-        *,
-        headless: bool,
-        run_token: str,
-        process_names: Sequence[str],
-        launch_kwargs: dict,
-        new_context_fn,
-        use_saved_state: bool = True,
-    ):
-        self.headless = headless
-        self.run_token = run_token
-        self.process_names = list(process_names)
-        self._launch_kwargs = dict(launch_kwargs)
-        self._new_context_fn = new_context_fn
-        self.use_saved_state = use_saved_state
-        self.playwright = None
-        self.browser = None
-        self.context = None
-        self.page = None
-
-    def start(self):
-        from playwright.sync_api import sync_playwright
-
-        # Unique marker so cleanup only targets this session's processes.
-        # Playwright puts the user data dir on the command line for the channel.
-        os.environ["ZOOM_SYNC_RUN_TOKEN"] = self.run_token
-        self.playwright = sync_playwright().start()
-        kwargs = dict(self._launch_kwargs)
-        # args marker appears on the process command line for scoped kill.
-        args = list(kwargs.get("args") or [])
-        args.append(f"--zoom-sync-run-token={self.run_token}")
-        kwargs["args"] = args
-        try:
-            self.browser = self.playwright.chromium.launch(**kwargs)
-        except Exception:
-            # macOS without Chrome installed: fall back to bundled Chromium.
-            if kwargs.get("channel"):
-                fallback = dict(kwargs)
-                fallback.pop("channel", None)
-                self.browser = self.playwright.chromium.launch(**fallback)
-            else:
-                raise
-        self.context = self._new_context_fn(self.browser, use_saved_state=self.use_saved_state)
-        self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
-        return self
-
-    def stop(self) -> None:
-        close_context(self.context, timeout=4.0)
-        close_browser(self.browser, timeout=4.0)
-        # Scoped force-kill for hung Edge/Chrome children from this run only.
-        kill_by_command_token(self.run_token, self.process_names, timeout=30.0)
-        stop_playwright(self.playwright, timeout=8.0)
-        self.page = None
-        self.context = None
-        self.browser = None
-        self.playwright = None
+  "lockfile.py": '"""Atomic process lock with ownership token and heartbeat.\r\n\r\nUses O_CREAT|O_EXCL so two processes cannot both create the lock. The lock\r\npayload stores a random token, PID, and heartbeat timestamp. Release only\r\nsucceeds when the token still matches. Stale locks are reclaimed only when the\r\nheartbeat is old AND the owning PID is not alive (or not the original process).\r\n"""\r\n\r\nfrom __future__ import annotations\r\n\r\nimport json\r\nimport os\r\nimport time\r\nimport uuid\r\nfrom dataclasses import dataclass\r\nfrom datetime import datetime, timezone\r\nfrom pathlib import Path\r\nfrom typing import Any, Dict, Optional  # noqa: F401 \u2014 Dict used in helpers\r\n\r\n\r\ndef _now_iso() -> str:\r\n    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")\r\n\r\n\r\ndef _pid_alive(pid: int) -> bool:\r\n    if pid <= 0:\r\n        return False\r\n    if os.name == "nt":\r\n        try:\r\n            import ctypes\r\n\r\n            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000\r\n            STILL_ACTIVE = 259\r\n            handle = ctypes.windll.kernel32.OpenProcess(\r\n                PROCESS_QUERY_LIMITED_INFORMATION, False, pid\r\n            )\r\n            if not handle:\r\n                return False\r\n            try:\r\n                exit_code = ctypes.c_ulong()\r\n                if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)) == 0:\r\n                    return False\r\n                return exit_code.value == STILL_ACTIVE\r\n            finally:\r\n                ctypes.windll.kernel32.CloseHandle(handle)\r\n        except Exception:\r\n            return False\r\n    # POSIX\r\n    try:\r\n        os.kill(pid, 0)\r\n    except ProcessLookupError:\r\n        return False\r\n    except PermissionError:\r\n        return True\r\n    except OSError:\r\n        return False\r\n    return True\r\n\r\n\r\n@dataclass\r\nclass LockHandle:\r\n    path: Path\r\n    token: str\r\n    pid: int\r\n\r\n    def heartbeat(self) -> None:\r\n        data = _read(self.path)\r\n        if not data or data.get("token") != self.token:\r\n            return\r\n        data["heartbeat_at"] = _now_iso()\r\n        data["heartbeat_epoch"] = time.time()\r\n        _write_replace(self.path, data)\r\n\r\n    def release(self) -> bool:\r\n        data = _read(self.path)\r\n        if not data:\r\n            return False\r\n        if data.get("token") != self.token:\r\n            return False\r\n        try:\r\n            self.path.unlink(missing_ok=True)\r\n            return True\r\n        except OSError:\r\n            return False\r\n\r\n\r\ndef _read(path: Path) -> Optional[Dict[str, Any]]:\r\n    try:\r\n        if not path.exists():\r\n            return None\r\n        raw = path.read_text(encoding="utf-8")\r\n        data = json.loads(raw)\r\n        return data if isinstance(data, dict) else None\r\n    except (OSError, json.JSONDecodeError, UnicodeError):\r\n        return None\r\n\r\n\r\ndef _write_replace(path: Path, data: Dict[str, Any]) -> None:\r\n    tmp = path.with_suffix(path.suffix + ".tmp")\r\n    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")\r\n    tmp.replace(path)\r\n\r\n\r\ndef acquire(path: Path, stale_minutes: float = 25.0) -> Optional[LockHandle]:\r\n    """Try to acquire the lock. Returns a handle or None if held by a healthy peer."""\r\n    path.parent.mkdir(parents=True, exist_ok=True)\r\n    token = uuid.uuid4().hex\r\n    pid = os.getpid()\r\n    payload = {\r\n        "token": token,\r\n        "pid": pid,\r\n        "started_at": _now_iso(),\r\n        "heartbeat_at": _now_iso(),\r\n        "heartbeat_epoch": time.time(),\r\n    }\r\n\r\n    # Fast path: exclusive create.\r\n    try:\r\n        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)\r\n        try:\r\n            os.write(fd, json.dumps(payload, indent=2).encode("utf-8"))\r\n        finally:\r\n            os.close(fd)\r\n        return LockHandle(path=path, token=token, pid=pid)\r\n    except FileExistsError:\r\n        pass\r\n    except OSError:\r\n        return None\r\n\r\n    existing = _read(path)\r\n    if existing is None:\r\n        # Unreadable or empty; try reclaim by unlink + recreate.\r\n        try:\r\n            path.unlink(missing_ok=True)\r\n        except OSError:\r\n            return None\r\n        return acquire(path, stale_minutes=stale_minutes)\r\n\r\n    # Legacy plain-PID lock (old format was just a pid string).\r\n    if "token" not in existing:\r\n        try:\r\n            age_min = (time.time() - path.stat().st_mtime) / 60.0\r\n        except OSError:\r\n            age_min = stale_minutes + 1\r\n        legacy_pid = None\r\n        try:\r\n            legacy_pid = int(path.read_text(encoding="utf-8").strip())\r\n        except Exception:\r\n            legacy_pid = existing.get("pid")\r\n        if age_min < stale_minutes and legacy_pid and _pid_alive(int(legacy_pid)):\r\n            return None\r\n        try:\r\n            path.unlink(missing_ok=True)\r\n        except OSError:\r\n            return None\r\n        return acquire(path, stale_minutes=stale_minutes)\r\n\r\n    owner_pid = int(existing.get("pid") or 0)\r\n    heartbeat_epoch = existing.get("heartbeat_epoch")\r\n    if isinstance(heartbeat_epoch, (int, float)):\r\n        stale = (time.time() - float(heartbeat_epoch)) > (stale_minutes * 60.0)\r\n    else:\r\n        try:\r\n            stale = (time.time() - path.stat().st_mtime) > (stale_minutes * 60.0)\r\n        except OSError:\r\n            stale = True\r\n\r\n    if not stale and _pid_alive(owner_pid):\r\n        return None\r\n\r\n    # Stale or dead owner: reclaim.\r\n    try:\r\n        path.unlink(missing_ok=True)\r\n    except OSError:\r\n        return None\r\n    return acquire(path, stale_minutes=stale_minutes)\r\n',
+  "procs.py": `"""Process helpers for Playwright browser lifecycle on Windows.\r
+\r
+Headless Edge can hang on graceful close. Cleanup is scoped to a unique run\r
+token embedded in the browser launch user-data-dir / env so unrelated Edge or\r
+Playwright sessions are never killed.\r
+"""\r
+\r
+from __future__ import annotations\r
+\r
+import os\r
+import subprocess\r
+import threading\r
+from typing import Sequence\r
+\r
+_CREATE_NO_WINDOW = 0x08000000\r
+\r
+\r
+def kill_process_tree(pid: int, timeout: float = 30.0) -> None:\r
+    """Force-kill a process and its descendants (Windows taskkill /F /T)."""\r
+    if not pid or pid <= 0:\r
+        return\r
+    try:\r
+        if os.name == "nt":\r
+            subprocess.run(\r
+                ["taskkill", "/PID", str(pid), "/T", "/F"],\r
+                capture_output=True,\r
+                timeout=timeout,\r
+                creationflags=_CREATE_NO_WINDOW,\r
+            )\r
+        else:\r
+            # Best-effort POSIX: kill process group if possible.\r
+            try:\r
+                os.killpg(pid, 9)\r
+            except Exception:\r
+                subprocess.run(["kill", "-9", str(pid)], capture_output=True, timeout=timeout)\r
+    except Exception:\r
+        pass\r
+\r
+\r
+def kill_by_command_token(\r
+    token: str,\r
+    process_names: Sequence[str],\r
+    timeout: float = 40.0,\r
+) -> None:\r
+    """Force-kill processes whose command line contains \`token\`.\r
+\r
+    \`token\` must be unique to this run (e.g. a UUID path segment). Never pass a\r
+    generic Playwright signature alone.\r
+    """\r
+    if not token or len(token) < 8:\r
+        return\r
+    names = [n for n in process_names if n]\r
+    if not names:\r
+        return\r
+\r
+    if os.name == "nt":\r
+        name_clauses = " -or ".join(f"$_.Name -eq '{n}'" for n in names)\r
+        safe_token = token.replace("'", "''")\r
+        ps = (\r
+            f"Get-CimInstance Win32_Process | Where-Object {{ "\r
+            f"({name_clauses}) -and ($_.CommandLine -like '*{safe_token}*') "\r
+            f"}} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force "\r
+            f"-ErrorAction SilentlyContinue }}"\r
+        )\r
+        try:\r
+            subprocess.run(\r
+                ["powershell", "-NoProfile", "-Command", ps],\r
+                capture_output=True,\r
+                timeout=timeout,\r
+                creationflags=_CREATE_NO_WINDOW,\r
+            )\r
+        except Exception:\r
+            pass\r
+        return\r
+\r
+    # macOS / Linux: pkill by token in the full command line (scoped).\r
+    try:\r
+        subprocess.run(\r
+            ["pkill", "-f", token],\r
+            capture_output=True,\r
+            timeout=timeout,\r
+        )\r
+    except Exception:\r
+        pass\r
+\r
+\r
+def stop_playwright(playwright, timeout: float = 10.0) -> None:\r
+    """Call playwright.stop() on the same logical wait, bounded by timeout.\r
+\r
+    Prefer calling this after browsers are already closed/killed. Uses a daemon\r
+    thread only as a last-resort timeout gate; the stop call itself may still\r
+    run in the background if it hangs.\r
+    """\r
+    if playwright is None:\r
+        return\r
+    done = threading.Event()\r
+\r
+    def _stop():\r
+        try:\r
+            playwright.stop()\r
+        except Exception:\r
+            pass\r
+        finally:\r
+            done.set()\r
+\r
+    threading.Thread(target=_stop, daemon=True).start()\r
+    done.wait(timeout)\r
+\r
+\r
+def close_context(context, timeout: float = 5.0) -> None:\r
+    if context is None:\r
+        return\r
+    done = threading.Event()\r
+\r
+    def _close():\r
+        try:\r
+            context.close()\r
+        except Exception:\r
+            pass\r
+        finally:\r
+            done.set()\r
+\r
+    threading.Thread(target=_close, daemon=True).start()\r
+    done.wait(timeout)\r
+\r
+\r
+def close_browser(browser, timeout: float = 5.0) -> None:\r
+    if browser is None:\r
+        return\r
+    done = threading.Event()\r
+\r
+    def _close():\r
+        try:\r
+            browser.close()\r
+        except Exception:\r
+            pass\r
+        finally:\r
+            done.set()\r
+\r
+    threading.Thread(target=_close, daemon=True).start()\r
+    done.wait(timeout)\r
+\r
+\r
+class BrowserSession:\r
+    """Owns one Playwright driver + browser + context for a single run phase."""\r
+\r
+    def __init__(\r
+        self,\r
+        *,\r
+        headless: bool,\r
+        run_token: str,\r
+        process_names: Sequence[str],\r
+        launch_kwargs: dict,\r
+        new_context_fn,\r
+        use_saved_state: bool = True,\r
+    ):\r
+        self.headless = headless\r
+        self.run_token = run_token\r
+        self.process_names = list(process_names)\r
+        self._launch_kwargs = dict(launch_kwargs)\r
+        self._new_context_fn = new_context_fn\r
+        self.use_saved_state = use_saved_state\r
+        self.playwright = None\r
+        self.browser = None\r
+        self.context = None\r
+        self.page = None\r
+\r
+    def start(self):\r
+        from playwright.sync_api import sync_playwright\r
+\r
+        # Unique marker so cleanup only targets this session's processes.\r
+        # Playwright puts the user data dir on the command line for the channel.\r
+        os.environ["ZOOM_SYNC_RUN_TOKEN"] = self.run_token\r
+        self.playwright = sync_playwright().start()\r
+        kwargs = dict(self._launch_kwargs)\r
+        # args marker appears on the process command line for scoped kill.\r
+        args = list(kwargs.get("args") or [])\r
+        args.append(f"--zoom-sync-run-token={self.run_token}")\r
+        kwargs["args"] = args\r
+        try:\r
+            self.browser = self.playwright.chromium.launch(**kwargs)\r
+        except Exception:\r
+            # macOS without Chrome installed: fall back to bundled Chromium.\r
+            if kwargs.get("channel"):\r
+                fallback = dict(kwargs)\r
+                fallback.pop("channel", None)\r
+                self.browser = self.playwright.chromium.launch(**fallback)\r
+            else:\r
+                raise\r
+        self.context = self._new_context_fn(self.browser, use_saved_state=self.use_saved_state)\r
+        self.page = self.context.pages[0] if self.context.pages else self.context.new_page()\r
+        return self\r
+\r
+    def stop(self) -> None:\r
+        close_context(self.context, timeout=4.0)\r
+        close_browser(self.browser, timeout=4.0)\r
+        # Scoped force-kill for hung Edge/Chrome children from this run only.\r
+        kill_by_command_token(self.run_token, self.process_names, timeout=30.0)\r
+        stop_playwright(self.playwright, timeout=8.0)\r
+        self.page = None\r
+        self.context = None\r
+        self.browser = None\r
+        self.playwright = None\r
 `,
-  "security.py": `"""Optional Windows ACL hardening for sensitive runtime paths."""
-
-from __future__ import annotations
-
-import logging
-import os
-import subprocess
-from pathlib import Path
-from typing import Iterable
-
-log = logging.getLogger("zoom_sync")
-
-_CREATE_NO_WINDOW = 0x08000000
-
-
-def apply_user_only_acls(paths: Iterable[Path]) -> None:
-    """Best-effort: restrict paths to current user, SYSTEM, and Administrators.
-
-    Failures are logged and ignored so sync still works in restricted environments.
-    """
-    if os.name != "nt":
-        return
-    user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
-    if not user:
-        return
-    for path in paths:
-        try:
-            if not path.exists():
-                continue
-            # Remove inheritance, then grant explicit rights.
-            commands = [
-                ["icacls", str(path), "/inheritance:r"],
-                [
-                    "icacls",
-                    str(path),
-                    "/grant:r",
-                    f"{user}:(OI)(CI)F",
-                    "SYSTEM:(OI)(CI)F",
-                    "Administrators:(OI)(CI)F",
-                ],
-            ]
-            # Files don't need (OI)(CI)
-            if path.is_file():
-                commands = [
-                    ["icacls", str(path), "/inheritance:r"],
-                    [
-                        "icacls",
-                        str(path),
-                        "/grant:r",
-                        f"{user}:F",
-                        "SYSTEM:F",
-                        "Administrators:F",
-                    ],
-                ]
-            for cmd in commands:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    creationflags=_CREATE_NO_WINDOW,
-                )
-                if result.returncode != 0:
-                    log.warning(
-                        "ACL command failed for %s: %s",
-                        path,
-                        (result.stderr or result.stdout or "").strip()[:200],
-                    )
-                    break
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Could not apply ACLs to %s: %s", path, exc)
+  "security.py": `"""Optional Windows ACL hardening for sensitive runtime paths."""\r
+\r
+from __future__ import annotations\r
+\r
+import logging\r
+import os\r
+import subprocess\r
+from pathlib import Path\r
+from typing import Iterable\r
+\r
+log = logging.getLogger("zoom_sync")\r
+\r
+_CREATE_NO_WINDOW = 0x08000000\r
+\r
+\r
+def apply_user_only_acls(paths: Iterable[Path]) -> None:\r
+    """Best-effort: restrict paths to current user, SYSTEM, and Administrators.\r
+\r
+    Failures are logged and ignored so sync still works in restricted environments.\r
+    """\r
+    if os.name != "nt":\r
+        return\r
+    user = os.environ.get("USERNAME") or os.environ.get("USER") or ""\r
+    if not user:\r
+        return\r
+    for path in paths:\r
+        try:\r
+            if not path.exists():\r
+                continue\r
+            # Remove inheritance, then grant explicit rights.\r
+            commands = [\r
+                ["icacls", str(path), "/inheritance:r"],\r
+                [\r
+                    "icacls",\r
+                    str(path),\r
+                    "/grant:r",\r
+                    f"{user}:(OI)(CI)F",\r
+                    "SYSTEM:(OI)(CI)F",\r
+                    "Administrators:(OI)(CI)F",\r
+                ],\r
+            ]\r
+            # Files don't need (OI)(CI)\r
+            if path.is_file():\r
+                commands = [\r
+                    ["icacls", str(path), "/inheritance:r"],\r
+                    [\r
+                        "icacls",\r
+                        str(path),\r
+                        "/grant:r",\r
+                        f"{user}:F",\r
+                        "SYSTEM:F",\r
+                        "Administrators:F",\r
+                    ],\r
+                ]\r
+            for cmd in commands:\r
+                result = subprocess.run(\r
+                    cmd,\r
+                    capture_output=True,\r
+                    text=True,\r
+                    timeout=30,\r
+                    creationflags=_CREATE_NO_WINDOW,\r
+                )\r
+                if result.returncode != 0:\r
+                    log.warning(\r
+                        "ACL command failed for %s: %s",\r
+                        path,\r
+                        (result.stderr or result.stdout or "").strip()[:200],\r
+                    )\r
+                    break\r
+        except Exception as exc:  # noqa: BLE001\r
+            log.warning("Could not apply ACLs to %s: %s", path, exc)\r
 `,
   "requirements.txt": "playwright==1.55.0\r\n",
-  "scripts/register-task.ps1": '# Register the Zoom Notes sync scheduled task (every 30 minutes, logged-on only).\n# Run from an elevated or same-user PowerShell session:\n#   powershell -NoProfile -File .\\scripts\\register-task.ps1\n\n$ErrorActionPreference = "Stop"\n\n$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)\n$RunPs1 = Join-Path $Root "run.ps1"\nif (-not (Test-Path -LiteralPath $RunPs1)) {\n    throw "run.ps1 not found at $RunPs1"\n}\n\n$TaskName = if ($env:ZOOM_TASK_NAME) { $env:ZOOM_TASK_NAME } else { "ZoomNotesSync" }\n$PsExe = Join-Path $env:SystemRoot "System32\\WindowsPowerShell\\v1.0\\powershell.exe"\n$Arg = "-NoProfile -ExecutionPolicy Bypass -File `"$RunPs1`""\n\n$Action = New-ScheduledTaskAction -Execute $PsExe -Argument $Arg -WorkingDirectory $Root\n$Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(1) `\n    -RepetitionInterval (New-TimeSpan -Minutes 30) `\n    -RepetitionDuration (New-TimeSpan -Days 3650)\n$Settings = New-ScheduledTaskSettingsSet `\n    -MultipleInstances IgnoreNew `\n    -ExecutionTimeLimit (New-TimeSpan -Minutes 30) `\n    -StartWhenAvailable `\n    -AllowStartIfOnBatteries `\n    -DontStopIfGoingOnBatteries\n# Interactive / logged-on user required for SSO re-auth UI.\n$Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited\n\nRegister-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger `\n    -Settings $Settings -Principal $Principal -Force | Out-Null\n\nWrite-Host "Registered task \'$TaskName\'."\nWrite-Host "  Action: $PsExe $Arg"\nWrite-Host "  Manage: Get-ScheduledTask -TaskName $TaskName"\nWrite-Host "  Run now: Start-ScheduledTask -TaskName $TaskName"\nWrite-Host "  Remove: Unregister-ScheduledTask -TaskName $TaskName -Confirm:`$false"\n',
-  "scripts/check.ps1": '# Local quality gate: unit tests (+ ruff if installed).\n$ErrorActionPreference = "Stop"\n$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)\nSet-Location -LiteralPath $Root\n\n$Py = Join-Path $Root ".venv\\Scripts\\python.exe"\nif (-not (Test-Path -LiteralPath $Py)) { $Py = "python" }\n\nWrite-Host "== pytest =="\n& $Py -m pytest\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n\n$Ruff = Join-Path $Root ".venv\\Scripts\\ruff.exe"\nif (Test-Path -LiteralPath $Ruff) {\n    Write-Host "== ruff check =="\n    & $Ruff check .\n    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n} else {\n    Write-Host "ruff not installed (optional): pip install ruff"\n}\n\nWrite-Host "OK"\nexit 0\n'
+  "scripts/register-task.ps1": '# Register the Zoom Notes sync scheduled task (every 30 minutes, logged-on only).\r\n# Run from an elevated or same-user PowerShell session:\r\n#   powershell -NoProfile -File .\\scripts\\register-task.ps1\r\n\r\n$ErrorActionPreference = "Stop"\r\n\r\n$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)\r\n$RunPs1 = Join-Path $Root "run.ps1"\r\nif (-not (Test-Path -LiteralPath $RunPs1)) {\r\n    throw "run.ps1 not found at $RunPs1"\r\n}\r\n\r\n$TaskName = if ($env:ZOOM_TASK_NAME) { $env:ZOOM_TASK_NAME } else { "ZoomNotesSync" }\r\n$PsExe = Join-Path $env:SystemRoot "System32\\WindowsPowerShell\\v1.0\\powershell.exe"\r\n$Arg = "-NoProfile -ExecutionPolicy Bypass -File `"$RunPs1`""\r\n\r\n$Action = New-ScheduledTaskAction -Execute $PsExe -Argument $Arg -WorkingDirectory $Root\r\n$Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(1) `\r\n    -RepetitionInterval (New-TimeSpan -Minutes 30) `\r\n    -RepetitionDuration (New-TimeSpan -Days 3650)\r\n$Settings = New-ScheduledTaskSettingsSet `\r\n    -MultipleInstances IgnoreNew `\r\n    -ExecutionTimeLimit (New-TimeSpan -Minutes 30) `\r\n    -StartWhenAvailable `\r\n    -AllowStartIfOnBatteries `\r\n    -DontStopIfGoingOnBatteries\r\n# Interactive / logged-on user required for SSO re-auth UI.\r\n$Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited\r\n\r\nRegister-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger `\r\n    -Settings $Settings -Principal $Principal -Force | Out-Null\r\n\r\nWrite-Host "Registered task \'$TaskName\'."\r\nWrite-Host "  Action: $PsExe $Arg"\r\nWrite-Host "  Manage: Get-ScheduledTask -TaskName $TaskName"\r\nWrite-Host "  Run now: Start-ScheduledTask -TaskName $TaskName"\r\nWrite-Host "  Remove: Unregister-ScheduledTask -TaskName $TaskName -Confirm:`$false"\r\n',
+  "scripts/check.ps1": '# Local quality gate: unit tests (+ ruff if installed).\r\n$ErrorActionPreference = "Stop"\r\n$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)\r\nSet-Location -LiteralPath $Root\r\n\r\n$Py = Join-Path $Root ".venv\\Scripts\\python.exe"\r\nif (-not (Test-Path -LiteralPath $Py)) { $Py = "python" }\r\n\r\nWrite-Host "== pytest =="\r\n& $Py -m pytest\r\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\r\n\r\n$Ruff = Join-Path $Root ".venv\\Scripts\\ruff.exe"\r\nif (Test-Path -LiteralPath $Ruff) {\r\n    Write-Host "== ruff check =="\r\n    & $Ruff check .\r\n    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\r\n} else {\r\n    Write-Host "ruff not installed (optional): pip install ruff"\r\n}\r\n\r\nWrite-Host "OK"\r\nexit 0\r\n'
 };
 
 // src/runner.ts

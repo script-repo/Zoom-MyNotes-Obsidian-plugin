@@ -24,6 +24,11 @@ STATUS_RETRYABLE = "retryable"
 
 INDEX_VERSION = 2
 
+# Bumped whenever the saved note layout changes. Downloaded records below this
+# are re-queued once so they are regenerated with the newest layout (e.g. the
+# raw transcript appended at the bottom).
+CONTENT_VERSION = 2
+
 
 class IndexCorruptError(Exception):
     """Raised when the on-disk index cannot be loaded safely."""
@@ -162,6 +167,31 @@ class IndexStore:
             self.save()
         return count
 
+    def requeue_pre_transcript(self) -> int:
+        """Re-queue downloaded notes saved before the transcript-append layout.
+
+        Records whose content_version is below CONTENT_VERSION are flipped to
+        retryable (due now) so they get re-opened once and regenerated with the
+        raw transcript appended. Reprocessing overwrites the same deterministic
+        filename, so no duplicate files are created.
+        """
+        count = 0
+        for key, rec in list(self.transcripts.items()):
+            if rec.get("status") != STATUS_DOWNLOADED:
+                continue
+            if int(rec.get("content_version") or 1) >= CONTENT_VERSION:
+                continue
+            rec = dict(rec)
+            rec["status"] = STATUS_RETRYABLE
+            rec["next_retry"] = ""
+            rec["last_outcome"] = "requeued_pre_transcript"
+            rec["last_error"] = "requeued to append raw transcript"
+            self.transcripts[key] = rec
+            count += 1
+        if count:
+            self.save()
+        return count
+
     def should_process(self, note_id: str, *, now: datetime = None) -> bool:
         """True if this note should be opened/checked on this run."""
         now = now or _now()
@@ -214,6 +244,8 @@ class IndexStore:
         sha256: str = "",
         last_outcome: str = "",
         last_error: str = "",
+        content_version: Optional[int] = None,
+        has_transcript: Optional[bool] = None,
     ) -> None:
         existing_key = self.resolve_id(note_id)
         key = existing_key or note_id
@@ -269,6 +301,15 @@ class IndexStore:
             rec["sha256"] = sha256
         elif prev.get("sha256"):
             rec["sha256"] = prev["sha256"]
+
+        if content_version is not None:
+            rec["content_version"] = int(content_version)
+        elif "content_version" in prev:
+            rec["content_version"] = prev["content_version"]
+        if has_transcript is not None:
+            rec["has_transcript"] = bool(has_transcript)
+        elif "has_transcript" in prev:
+            rec["has_transcript"] = prev["has_transcript"]
 
         if status == STATUS_DOWNLOADED:
             rec["next_retry"] = ""

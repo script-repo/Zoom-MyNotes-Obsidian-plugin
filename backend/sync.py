@@ -38,6 +38,7 @@ import procs
 import security
 import zoom_notes
 from index_store import (
+    CONTENT_VERSION,
     STATUS_DOWNLOADED,
     STATUS_NO_TRANSCRIPT,
     STATUS_RETRYABLE,
@@ -59,6 +60,7 @@ class RunStats:
     scanned: int = 0
     opened: int = 0
     downloaded: int = 0
+    transcripts: int = 0
     absent: int = 0
     retryable: int = 0
     failed: int = 0
@@ -69,6 +71,7 @@ class RunStats:
     def summary(self, index_size: int, code: int) -> str:
         return (
             f"scanned={self.scanned} opened={self.opened} downloaded={self.downloaded} "
+            f"transcripts={self.transcripts} "
             f"absent={self.absent} retryable={self.retryable} selector_broken={self.selector_broken} "
             f"failed={self.failed} skipped_known={self.skipped_known} orphans={self.orphans} "
             f"index={index_size} exit={code}"
@@ -368,13 +371,22 @@ def process_notes(page, index: IndexStore, lock: lockfile.LockHandle | None, sta
                 size=result.size,
                 sha256=result.sha256,
                 last_outcome="downloaded",
+                content_version=CONTENT_VERSION,
+                has_transcript=result.has_transcript,
             )
             stats.downloaded += 1
+            if result.has_transcript:
+                stats.transcripts += 1
             try:
                 shown = str(dest.relative_to(config.TRANSCRIPTS_DIR))
             except ValueError:
                 shown = str(dest)
-            log.info("Saved note content: %s -> %s", label, shown)
+            log.info(
+                "Saved note content%s: %s -> %s",
+                " + transcript" if result.has_transcript else "",
+                label,
+                shown,
+            )
         elif result.outcome == DownloadOutcome.ABSENT:
             index.add(
                 note_id,
@@ -491,6 +503,13 @@ def run_browser_phase(lock: lockfile.LockHandle | None = None) -> int:
         log.info(
             "Re-queued %d note(s) previously marked no-transcript (likely menu/UI miss).",
             requeued,
+        )
+
+    backfill = index.requeue_pre_transcript()
+    if backfill:
+        log.info(
+            "Re-queued %d already-downloaded note(s) to append the raw transcript.",
+            backfill,
         )
 
     orphans = index.find_orphan_files(config.TRANSCRIPTS_DIR, config.BASE_DIR)
