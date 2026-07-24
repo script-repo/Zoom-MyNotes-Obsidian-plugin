@@ -5,9 +5,16 @@
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$RunPs1 = Join-Path $Root "run.ps1"
+# The Obsidian plugin (schedule.ts) generates the runner as run-sync.ps1.
+# Accept the legacy name run.ps1 as a fallback for older deployments.
+$RunPs1 = Join-Path $Root "run-sync.ps1"
 if (-not (Test-Path -LiteralPath $RunPs1)) {
-    throw "run.ps1 not found at $RunPs1"
+    $Legacy = Join-Path $Root "run.ps1"
+    if (Test-Path -LiteralPath $Legacy) {
+        $RunPs1 = $Legacy
+    } else {
+        throw "runner not found at $RunPs1 (or run.ps1)"
+    }
 }
 
 $TaskName = if ($env:ZOOM_TASK_NAME) { $env:ZOOM_TASK_NAME } else { "ZoomNotesSync" }
